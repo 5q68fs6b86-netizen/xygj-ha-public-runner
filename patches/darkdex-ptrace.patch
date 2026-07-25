@@ -1,0 +1,78 @@
+--- darkdex_dump.cpp
++++ darkdex_dump.cpp
+@@ -8,6 +8,9 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <dirent.h>
++#include <cerrno>
++#include <sys/ptrace.h>
++#include <sys/wait.h>
+ static const uint8_t DEXM[4]={0x64,0x65,0x78,0x0a}, CDEXM[4]={0x63,0x64,0x65,0x78};
+ #pragma pack(push,1)
+ struct MapItem{uint16_t type;uint16_t un;uint32_t size;uint32_t off;};
+@@ -22,15 +25,52 @@
+ static uint32_t carve_size(const uint8_t*p,size_t a){if(a<0x70)return 0;if(*(uint32_t*)(p+40)!=0x12345678u)return 0;
+  uint32_t fs=*(uint32_t*)(p+32),hs=*(uint32_t*)(p+36);if(hs<0x28||hs>0x200)return 0;if(fs<hs||fs>96u*1024*1024)return 0;return fs;}
+ 
++static int attached_pid=-1;
++static void detach_target(){
++ if(attached_pid<=0)return;
++ if(ptrace(PTRACE_DETACH,attached_pid,nullptr,nullptr)<0){
++  int detach_errno=errno;
++  printf("DARKDEX_WARN ptrace detach failed errno=%d message=%s\n",detach_errno,strerror(detach_errno));
++ }else printf("DARKDEX_MEM ptrace_detached pid=%d\n",attached_pid);
++ attached_pid=-1;
++}
++
++static int open_target_memory(int pid){
++ char mp[256];snprintf(mp,sizeof(mp),"/proc/%d/mem",pid);
++ int fd=open(mp,O_RDONLY);if(fd>=0){printf("DARKDEX_MEM mode=direct\n");return fd;}
++ int direct_errno=errno;
++ printf("DARKDEX_MEM direct_open_failed errno=%d message=%s\n",direct_errno,strerror(direct_errno));
++ if(ptrace(PTRACE_ATTACH,pid,nullptr,nullptr)<0){
++  int attach_errno=errno;
++  printf("DARKDEX_ERR ptrace attach failed errno=%d message=%s\n",attach_errno,strerror(attach_errno));
++  return -1;
++ }
++ int status=0;
++ if(waitpid(pid,&status,0)<0||!WIFSTOPPED(status)){
++  int wait_errno=errno;
++  printf("DARKDEX_ERR ptrace wait failed errno=%d message=%s status=%d\n",wait_errno,strerror(wait_errno),status);
++  ptrace(PTRACE_DETACH,pid,nullptr,nullptr);
++  return -1;
++ }
++ fd=open(mp,O_RDONLY);int open_errno=errno;
++ if(fd<0){
++  printf("DARKDEX_ERR open mem after ptrace failed errno=%d message=%s\n",open_errno,strerror(open_errno));
++  ptrace(PTRACE_DETACH,pid,nullptr,nullptr);
++  return -1;
++ }
++ attached_pid=pid;
++ printf("DARKDEX_MEM mode=ptrace_attach target_frozen=1\n");
++ return fd;
++}
++
+ int main(int argc,char**argv){
+  if(argc<3){fprintf(stderr,"usage: %s <package> <outdir>\n",argv[0]);return 1;}
+  const char*pkg=argv[1];const char*out=argv[2];
+- int pid=-1; for(int _t=0;_t<30&&pid<=0;_t++){pid=find_pid(pkg); if(pid<=0)sleep(1);} if(pid>0)sleep(8);
++ int pid=-1; for(int _t=0;_t<300&&pid<=0;_t++){pid=find_pid(pkg); if(pid<=0)usleep(100000);} if(pid>0)usleep(900000);
+  if(pid<=0){printf("DARKDEX_ERR target not running: %s\n",pkg);return 2;}
+  printf("DARKDEX target=%s pid=%d out=%s\n",pkg,pid,out);
+- char mp[256];snprintf(mp,256,"/proc/%d/mem",pid);int fd=open(mp,O_RDONLY);
+- if(fd<0){printf("DARKDEX_ERR open mem failed (need root)\n");return 3;}
+- char mpath[256];snprintf(mpath,256,"/proc/%d/maps",pid);FILE*mf=fopen(mpath,"r");if(!mf)return 3;
++ int fd=open_target_memory(pid);if(fd<0)return 3;
++ char mpath[256];snprintf(mpath,256,"/proc/%d/maps",pid);FILE*mf=fopen(mpath,"r");if(!mf){close(fd);detach_target();return 3;}
+  std::vector<uint8_t> buf;char line[1024];int dex=0,rec=0;std::set<std::string> seenC;std::set<std::string> seenR;
+  std::set<std::string> urls,hosts,classes,packer,cfgs;
+ 
+@@ -79,7 +119,7 @@
+    else if(!memcmp(B+i,"\"appId\"",7)||!memcmp(B+i,"\"apkVersion\"",12)){size_t j=i;std::string c;while(j<(size_t)n&&B[j]>=0x20&&B[j]<0x7f&&c.size()<160){c+=(char)B[j];j++;}cfgs.insert(c);i=j;}
+   }
+  }
+- fclose(mf);close(fd);
++ fclose(mf);close(fd);detach_target();
+  char ip[640];snprintf(ip,640,"%s/intel.txt",out);FILE*io=fopen(ip,"w");
+  if(io){fprintf(io,"# darkdex intel %s pid %d\n## PACKER\n",pkg,pid);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
+   fprintf(io,"## HOSTS\n");int z=0;for(auto&x:hosts){if(z++>120)break;fprintf(io,"  %s\n",x.c_str());}

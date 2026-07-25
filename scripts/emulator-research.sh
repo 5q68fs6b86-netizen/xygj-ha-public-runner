@@ -23,6 +23,8 @@ collect_runtime_diagnostics() {
     > "$diagnostics/package-state.txt" 2>&1
   adb shell id > "$diagnostics/android-root-context.txt" 2>&1
   adb shell getenforce >> "$diagnostics/android-root-context.txt" 2>&1
+  adb shell cat /proc/self/status \
+    >> "$diagnostics/android-root-context.txt" 2>&1
   adb shell mount | grep -F ' /proc ' \
     >> "$diagnostics/android-root-context.txt" 2>&1
   adb pull /data/tombstones "$diagnostics/tombstones" \
@@ -74,7 +76,15 @@ fi
 
 adb shell setenforce 0 >> "$diagnostics/adb-root.txt" 2>&1 || true
 
-if ! adb install -r -g private/target.apk \
+apk_path="private/target.apk"
+if [[ "${APK_VARIANT:-original}" == "x86-shell" ]]; then
+  apk_path="private/target-x86.apk"
+fi
+printf 'apk_variant=%s\n' "${APK_VARIANT:-original}" \
+  > "$diagnostics/apk-variant.txt"
+
+if ! timeout --foreground --kill-after=30s 8m \
+    adb install -r -g "$apk_path" \
     > "$diagnostics/apk-install.txt" 2>&1; then
   set_result "APK_INSTALL_FAILED"
   exit 1
@@ -91,7 +101,8 @@ adb logcat -v threadtime > "$diagnostics/android-logcat.txt" 2>&1 &
 logcat_pid="$!"
 
 extract_rc=0
-adb shell "$remote_dir/libdd '$PACKAGE' '$remote_dir/dex'" \
+timeout --foreground --kill-after=30s 8m \
+  adb shell "$remote_dir/libdd '$PACKAGE' '$remote_dir/dex'" \
   > "$diagnostics/extraction.txt" 2>&1 &
 extractor_pid="$!"
 
@@ -143,5 +154,5 @@ if (( dex_count == 0 )); then
 fi
 
 find "$output" -type f -name '*.dex' \
-  -exec shasum --algorithm 256 {} + > "$output/SHA256SUMS"
+  -exec sha256sum {} + > "$output/SHA256SUMS"
 set_result "DEX_EXTRACTED count=$dex_count"
