@@ -103,15 +103,25 @@ jobs:
         if: always()
         run: |
           set +e
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            perl -e 'alarm shift; exec @ARGV or exit 127' \
+              "$seconds" "$@"
+          }
+
           if ! test -s private/diagnostics/adb-devices.txt; then
-            adb devices -l > private/diagnostics/adb-devices.txt 2>&1
+            run_with_timeout 10 adb devices -l \
+              > private/diagnostics/adb-devices.txt 2>&1
           fi
           if ! test -s private/diagnostics/android-logcat.txt; then
-            adb logcat -d -t 3000 \
+            run_with_timeout 20 adb logcat -d -t 3000 \
               > private/diagnostics/android-logcat.txt 2>&1
           fi
           if ! test -s private/diagnostics/app-exit-info.txt; then
-            adb shell dumpsys activity exit-info "$PACKAGE" \
+            run_with_timeout 15 adb shell \
+              dumpsys activity exit-info "$PACKAGE" \
               > private/diagnostics/app-exit-info.txt 2>&1
           fi
           uname -a > private/diagnostics/host-system.txt 2>&1
