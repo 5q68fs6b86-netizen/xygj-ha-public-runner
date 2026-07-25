@@ -33,6 +33,7 @@ collect_runtime_diagnostics() {
   if [[ -n "$extractor_pid" ]]; then
     kill "$extractor_pid" 2>/dev/null
     wait "$extractor_pid" 2>/dev/null
+    adb shell "pkill -TERM -f '$remote_dir/libdd'" 2>/dev/null || true
   fi
 
   if [[ -n "$logcat_pid" ]]; then
@@ -115,10 +116,14 @@ adb shell cmd package resolve-activity --brief \
 launcher_component="$(tr -d '\r' \
   < "$diagnostics/launcher-activity.txt" | tail -n 1)"
 if [[ "$launcher_component" == */* ]]; then
-  adb shell am start -W -n "$launcher_component" \
+  # Waiting for a fully drawn activity deadlocks while the extractor freezes
+  # the process with ptrace. The non-waiting start only needs AMS acceptance.
+  timeout --foreground --kill-after=5s 30s \
+    adb shell am start -n "$launcher_component" \
     > "$diagnostics/app-launch.txt" 2>&1 || true
 else
-  adb shell monkey -p "$PACKAGE" -c android.intent.category.LAUNCHER 1 \
+  timeout --foreground --kill-after=5s 30s \
+    adb shell monkey -p "$PACKAGE" -c android.intent.category.LAUNCHER 1 \
     > "$diagnostics/app-launch.txt" 2>&1 || true
 fi
 
