@@ -26,8 +26,8 @@ env:
 
 jobs:
   research:
-    name: Research in native ARM64 emulator
-    runs-on: macos-14
+    name: Research in ARM64 software emulator
+    runs-on: macos-26
     timeout-minutes: 35
 
     steps:
@@ -89,13 +89,13 @@ jobs:
           api-level: 30
           target: google_apis
           arch: arm64-v8a
-          profile: pixel_2
+          profile: Galaxy Nexus
           cores: 2
-          ram-size: 3072M
-          heap-size: 512M
-          disk-size: 8G
-          emulator-boot-timeout: 600
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          ram-size: 2048M
+          heap-size: 384M
+          disk-size: 6G
+          emulator-boot-timeout: 900
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -accel off -no-metrics
           disable-animations: false
           script: bash scripts/emulator-research.sh
 
@@ -146,11 +146,13 @@ jobs:
           # output and diagnostics belong in the encrypted artifact.
           tar -czf private/research-output.tar.gz \
             -C private output diagnostics
+          rm -f encrypted/research-output.cms encrypted/SHA256SUMS
           openssl cms -encrypt -binary -aes-256-gcm \
             -in private/research-output.tar.gz \
             -outform DER \
             -out encrypted/research-output.cms \
             encryption/artifact-recipient-cert.pem
+          test -s encrypted/research-output.cms
           shasum --algorithm 256 encrypted/research-output.cms \
             > encrypted/SHA256SUMS
           openssl cms -cmsout -inform DER \
