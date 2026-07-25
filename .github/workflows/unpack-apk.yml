@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: xygj-kvm-emulator-research
+  group: xygj-arm64-emulator-research
   cancel-in-progress: false
 
 env:
@@ -21,13 +21,13 @@ env:
   APK_URL: https://imtt.dd.qq.com/sjy.00022/sjy.00004/16891/apk/B31425CA64BBF8161D5A7D2F78607EEE.apk?fsname=com.yueme.itv_6.11.4.apk
   DARKDEX_APK_SHA256: d9466c7b87ab330ef9bf36f0167e2b18b95d9c32d7a263df785a434af25298f4
   DARKDEX_COMMIT: 0862ceba78aa89f58a14edf11717ae0339aaa592
-  DARKDEX_X86_64_SHA256: 7d5e178fc6a3b34bdaeeb75a942eb7ea1fed77137351dc5a5956a85a562cf892
+  DARKDEX_ARM64_SHA256: 7bc918c7621b6e1f1b02ced00f16dcac8e082be6bd5b99530e0333039dfdff4a
   PACKAGE: com.yueme.itv
 
 jobs:
   research:
-    name: Research in rooted KVM emulator
-    runs-on: ubuntu-24.04
+    name: Research in native ARM64 emulator
+    runs-on: macos-14
     timeout-minutes: 35
 
     steps:
@@ -66,28 +66,20 @@ jobs:
             --retry 5 --retry-all-errors --connect-timeout 30 \
             --output private/target.apk "$APK_URL"
           echo "$APK_SHA256  private/target.apk" \
-            | sha256sum --check --strict
-          test "$(stat -c '%s' private/target.apk)" = 237327095
+            | shasum --algorithm 256 --check
+          test "$(wc -c < private/target.apk | tr -d ' ')" = 237327095
 
           curl --fail --location \
             --retry 5 --retry-all-errors --connect-timeout 30 \
             --output private/darkdex.apk \
             "https://raw.githubusercontent.com/Krainium/DarkDex/$DARKDEX_COMMIT/darkdex.apk"
           echo "$DARKDEX_APK_SHA256  private/darkdex.apk" \
-            | sha256sum --check --strict
-          unzip -p private/darkdex.apk lib/x86_64/libdd.so \
-            > private/libdd-x86_64
-          echo "$DARKDEX_X86_64_SHA256  private/libdd-x86_64" \
-            | sha256sum --check --strict
-          chmod 700 private/libdd-x86_64
-
-      - name: Enable KVM hardware acceleration
-        run: |
-          set -euo pipefail
-          test -c /dev/kvm
-          sudo chmod 0666 /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
+            | shasum --algorithm 256 --check
+          unzip -p private/darkdex.apk lib/arm64-v8a/libdd.so \
+            > private/libdd
+          echo "$DARKDEX_ARM64_SHA256  private/libdd" \
+            | shasum --algorithm 256 --check
+          chmod 700 private/libdd
 
       - name: Run research in Android emulator
         uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
@@ -96,16 +88,15 @@ jobs:
         with:
           api-level: 30
           target: google_apis
-          arch: x86_64
+          arch: arm64-v8a
           profile: pixel_2
           cores: 2
-          ram-size: 4096M
+          ram-size: 3072M
           heap-size: 512M
           disk-size: 8G
           emulator-boot-timeout: 600
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
           disable-animations: false
-          disable-linux-hw-accel: false
           script: bash scripts/emulator-research.sh
 
       - name: Collect private diagnostics
@@ -116,16 +107,17 @@ jobs:
             adb devices -l > private/diagnostics/adb-devices.txt 2>&1
           fi
           if ! test -s private/diagnostics/android-logcat.txt; then
-            timeout 25s adb logcat -d -t 3000 \
+            adb logcat -d -t 3000 \
               > private/diagnostics/android-logcat.txt 2>&1
           fi
           if ! test -s private/diagnostics/app-exit-info.txt; then
-            timeout 15s adb shell dumpsys activity exit-info "$PACKAGE" \
+            adb shell dumpsys activity exit-info "$PACKAGE" \
               > private/diagnostics/app-exit-info.txt 2>&1
           fi
-          sudo dmesg --ctime | tail -500 \
-            > private/diagnostics/host-dmesg.txt 2>&1
-          find private -type f -printf '%P\t%s bytes\n' \
+          uname -a > private/diagnostics/host-system.txt 2>&1
+          sysctl -n machdep.cpu.brand_string \
+            >> private/diagnostics/host-system.txt 2>&1
+          find private -type f -exec stat -f '%N\t%z bytes' {} \; \
             > private/diagnostics/file-inventory.txt
 
       - name: Encrypt all research output
@@ -142,20 +134,19 @@ jobs:
 
           # APKs and the extractor are pinned reproducible inputs. Only runtime
           # output and diagnostics belong in the encrypted artifact.
-          tar --create --gzip --file private/research-output.tar.gz \
-            --directory private output diagnostics
+          tar -czf private/research-output.tar.gz \
+            -C private output diagnostics
           openssl cms -encrypt -binary -aes-256-gcm \
             -in private/research-output.tar.gz \
             -outform DER \
             -out encrypted/research-output.cms \
             encryption/artifact-recipient-cert.pem
-          sha256sum encrypted/research-output.cms \
+          shasum --algorithm 256 encrypted/research-output.cms \
             > encrypted/SHA256SUMS
           openssl cms -cmsout -inform DER \
             -in encrypted/research-output.cms -noout
 
-          sudo find private -type f -exec shred -u -- {} +
-          sudo find private -depth -type d -empty -delete
+          rm -rf private
           echo "Encrypted artifact created with RSA-4096 and AES-256-GCM"
 
       - name: Upload encrypted artifact only

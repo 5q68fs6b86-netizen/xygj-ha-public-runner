@@ -5,6 +5,7 @@ diagnostics="private/diagnostics"
 output="private/output"
 remote_dir="/data/local/tmp/xygj-darkdex"
 logcat_pid=""
+extractor_pid=""
 
 collect_runtime_diagnostics() {
   local exit_code="$?"
@@ -20,8 +21,17 @@ collect_runtime_diagnostics() {
     > "$diagnostics/activity-state.txt" 2>&1
   adb shell dumpsys package "$PACKAGE" \
     > "$diagnostics/package-state.txt" 2>&1
-  adb shell ls -la /data/tombstones \
-    > "$diagnostics/tombstones.txt" 2>&1
+  adb shell id > "$diagnostics/android-root-context.txt" 2>&1
+  adb shell getenforce >> "$diagnostics/android-root-context.txt" 2>&1
+  adb shell mount | grep -F ' /proc ' \
+    >> "$diagnostics/android-root-context.txt" 2>&1
+  adb pull /data/tombstones "$diagnostics/tombstones" \
+    > "$diagnostics/tombstones-pull.txt" 2>&1
+
+  if [[ -n "$extractor_pid" ]]; then
+    kill "$extractor_pid" 2>/dev/null
+    wait "$extractor_pid" 2>/dev/null
+  fi
 
   if [[ -n "$logcat_pid" ]]; then
     kill "$logcat_pid" 2>/dev/null
@@ -64,8 +74,7 @@ fi
 
 adb shell setenforce 0 >> "$diagnostics/adb-root.txt" 2>&1 || true
 
-if ! timeout --foreground --kill-after=30s 8m \
-    adb install -r -g private/target.apk \
+if ! adb install -r -g private/target.apk \
     > "$diagnostics/apk-install.txt" 2>&1; then
   set_result "APK_INSTALL_FAILED"
   exit 1
@@ -73,7 +82,7 @@ fi
 
 adb shell pm path "$PACKAGE" >> "$diagnostics/apk-install.txt" 2>&1
 adb shell "rm -rf '$remote_dir' && mkdir -p '$remote_dir/dex'"
-adb push private/libdd-x86_64 "$remote_dir/libdd" \
+adb push private/libdd "$remote_dir/libdd" \
   > "$diagnostics/extractor-push.txt" 2>&1
 adb shell chmod 700 "$remote_dir/libdd"
 
@@ -82,8 +91,7 @@ adb logcat -v threadtime > "$diagnostics/android-logcat.txt" 2>&1 &
 logcat_pid="$!"
 
 extract_rc=0
-timeout --foreground --kill-after=30s 8m \
-  adb shell "$remote_dir/libdd '$PACKAGE' '$remote_dir/dex'" \
+adb shell "$remote_dir/libdd '$PACKAGE' '$remote_dir/dex'" \
   > "$diagnostics/extraction.txt" 2>&1 &
 extractor_pid="$!"
 
@@ -135,5 +143,5 @@ if (( dex_count == 0 )); then
 fi
 
 find "$output" -type f -name '*.dex' \
-  -exec sha256sum {} + > "$output/SHA256SUMS"
+  -exec shasum --algorithm 256 {} + > "$output/SHA256SUMS"
 set_result "DEX_EXTRACTED count=$dex_count"
