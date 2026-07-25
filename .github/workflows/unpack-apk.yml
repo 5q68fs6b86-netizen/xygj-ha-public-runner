@@ -112,11 +112,17 @@ jobs:
         if: always()
         run: |
           set +e
-          adb devices -l > private/diagnostics/adb-devices.txt 2>&1
-          timeout 25s adb logcat -d -t 3000 \
-            > private/diagnostics/android-logcat.txt 2>&1
-          timeout 15s adb shell dumpsys activity exit-info "$PACKAGE" \
-            > private/diagnostics/app-exit-info.txt 2>&1
+          if ! test -s private/diagnostics/adb-devices.txt; then
+            adb devices -l > private/diagnostics/adb-devices.txt 2>&1
+          fi
+          if ! test -s private/diagnostics/android-logcat.txt; then
+            timeout 25s adb logcat -d -t 3000 \
+              > private/diagnostics/android-logcat.txt 2>&1
+          fi
+          if ! test -s private/diagnostics/app-exit-info.txt; then
+            timeout 15s adb shell dumpsys activity exit-info "$PACKAGE" \
+              > private/diagnostics/app-exit-info.txt 2>&1
+          fi
           sudo dmesg --ctime | tail -500 \
             > private/diagnostics/host-dmesg.txt 2>&1
           find private -type f -printf '%P\t%s bytes\n' \
