@@ -1,0 +1,42 @@
+name: Probe ARM64 host capabilities
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-22.04-arm
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 3
+    steps:
+      - name: Probe kernel capabilities
+        run: |
+          set -u
+          echo "runner=${{ matrix.runner }}"
+          uname -a
+          printf 'architecture='
+          dpkg --print-architecture
+          printf 'kvm_device='
+          if [[ -c /dev/kvm ]]; then
+            stat -c '%A %U:%G %t:%T %n' /dev/kvm
+          else
+            echo absent
+          fi
+          printf 'binder_module='
+          if modinfo binder_linux >/dev/null 2>&1; then
+            modinfo -F filename binder_linux
+          else
+            echo absent
+          fi
+          printf 'binder_filesystem='
+          grep -w binder /proc/filesystems || echo absent
+          printf 'virtualization='
+          systemd-detect-virt || true
