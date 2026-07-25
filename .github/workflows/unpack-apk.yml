@@ -6,7 +6,7 @@ on:
       redroid_image:
         description: Redroid ARM64 image
         required: true
-        default: redroid/redroid:11.0.0-latest
+        default: redroid/redroid:12.0.0_64only-latest
         type: string
       warmup_seconds:
         description: Seconds to wait after launching the app
@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: xygj-arm64-research-podman-v2
+  group: xygj-arm64-research-android12
   cancel-in-progress: false
 
 env:
@@ -75,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y adb curl g++ git podman
+          sudo apt-get install -y adb curl g++ git
           if ! modinfo binder_linux >/dev/null 2>&1; then
             sudo apt-get install -y "linux-modules-extra-$(uname -r)"
           fi
@@ -137,41 +137,34 @@ jobs:
             -o private/darkdex/native/darkdex_intel \
             private/darkdex/native/darkdex_intel.cpp
 
-      - name: Pull official Redroid image with Podman
+      - name: Pull official Android 12 Redroid image
         timeout-minutes: 10
         env:
           REDROID_IMAGE: ${{ inputs.redroid_image }}
         run: |
           set -euo pipefail
           timeout --foreground --kill-after=30s 8m \
-            sudo podman pull --arch arm64 "docker.io/$REDROID_IMAGE"
-          sudo podman image inspect "docker.io/$REDROID_IMAGE" \
+            docker pull "$REDROID_IMAGE"
+          docker image inspect "$REDROID_IMAGE" \
             --format '{{json .Architecture}} {{json .Os}}'
 
-      - name: Start Redroid with Podman
+      - name: Start Android 12 Redroid
         timeout-minutes: 3
         env:
           REDROID_IMAGE: ${{ inputs.redroid_image }}
         run: |
           set -euo pipefail
-          sudo -n setsid nohup podman run --detach --privileged \
-              --name redroid \
-              --security-opt apparmor=unconfined \
-              --security-opt seccomp=unconfined \
-              --publish 5555:5555 \
-              --volume "$BINDER_DEVICE:/dev/binder" \
-              --volume "$HWBINDER_DEVICE:/dev/hwbinder" \
-              --volume "$VNDBINDER_DEVICE:/dev/vndbinder" \
-              "docker.io/$REDROID_IMAGE" \
-              androidboot.use_memfd=1 \
-              androidboot.redroid_width=720 \
-              androidboot.redroid_height=1280 \
-              androidboot.redroid_dpi=320 \
-              androidboot.redroid_gpu_mode=guest \
-            > private/diagnostics/podman-start.txt 2>&1 \
-            < /dev/null &
-          echo "$!" > private/diagnostics/podman-launcher.pid
-          disown || true
+          docker run --detach --privileged --name redroid \
+            --publish 5555:5555 \
+            --volume "$BINDER_DEVICE:/dev/binder" \
+            --volume "$HWBINDER_DEVICE:/dev/hwbinder" \
+            --volume "$VNDBINDER_DEVICE:/dev/vndbinder" \
+            "$REDROID_IMAGE" \
+            androidboot.use_memfd=1 \
+            androidboot.redroid_width=720 \
+            androidboot.redroid_height=1280 \
+            androidboot.redroid_dpi=320 \
+            androidboot.redroid_gpu_mode=guest
 
           # Container-runtime operations after this point are intentionally
           # avoided. Readiness and diagnostics use ADB only.
