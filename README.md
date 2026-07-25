@@ -1,8 +1,8 @@
-# ARM64 Android compatibility research runner
+# Android interoperability research runner
 
 This repository contains a reproducible GitHub Actions environment for authorized
-interoperability research on an Android application. It starts an ARM64 Redroid
-container and captures runtime files needed to build a Home Assistant integration.
+interoperability research on an Android application. It starts a rooted Android
+KVM emulator and captures runtime files needed to build a Home Assistant integration.
 
 No account credentials, HAR files, cookies, access tokens, private keys, APK files,
 plaintext runtime files, or decrypted application code are stored in this repository
