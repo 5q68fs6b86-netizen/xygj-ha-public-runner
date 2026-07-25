@@ -81,6 +81,14 @@ jobs:
             | sha256sum --check --strict
           chmod 700 private/libdd-x86_64
 
+      - name: Enable KVM hardware acceleration
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
       - name: Run research in Android emulator
         uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         env:
@@ -96,7 +104,8 @@ jobs:
           disk-size: 8G
           emulator-boot-timeout: 600
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
-          disable-animations: true
+          disable-animations: false
+          disable-linux-hw-accel: false
           script: bash scripts/emulator-research.sh
 
       - name: Collect private diagnostics
