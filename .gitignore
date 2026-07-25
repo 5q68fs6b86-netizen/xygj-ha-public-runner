@@ -1,0 +1,7 @@
+private/
+encrypted/
+*.apk
+*.dex
+*.cms
+*.key
+*private*.pem

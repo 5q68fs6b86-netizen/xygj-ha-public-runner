@@ -1,0 +1,336 @@
+name: ARM64 compatibility research
+
+on:
+  workflow_dispatch:
+    inputs:
+      redroid_image:
+        description: Redroid ARM64 image
+        required: true
+        default: redroid/redroid:11.0.0-latest
+        type: string
+      warmup_seconds:
+        description: Seconds to wait after launching the app
+        required: true
+        default: "45"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xygj-arm64-research
+  cancel-in-progress: false
+
+env:
+  ADB_TARGET: 127.0.0.1:5555
+  APK_SHA256: 625184711e70a09f08f1bf3365ac7e31e25887bac8b171a33c9f4092c74e8a04
+  APK_URL: https://imtt.dd.qq.com/sjy.00022/sjy.00004/16891/apk/B31425CA64BBF8161D5A7D2F78607EEE.apk?fsname=com.yueme.itv_6.11.4.apk
+  DARKDEX_COMMIT: 0862ceba78aa89f58a14edf11717ae0339aaa592
+  PACKAGE: com.yueme.itv
+
+jobs:
+  research:
+    name: Research on ARM64 Redroid
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out recipient certificate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Initialize private workspace
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p private/diagnostics private/output encrypted
+          : > private/diagnostics/adb-devices.txt
+          : > private/diagnostics/android-logcat.txt
+          : > private/diagnostics/app-processes.txt
+          : > private/diagnostics/extraction.txt
+          : > private/diagnostics/host-dmesg.txt
+          : > private/diagnostics/result.txt
+          openssl x509 -in encryption/artifact-recipient-cert.pem \
+            -noout -fingerprint -sha256
+
+      - name: Validate inputs
+        env:
+          REDROID_IMAGE: ${{ inputs.redroid_image }}
+          WARMUP_SECONDS: ${{ inputs.warmup_seconds }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REDROID_IMAGE" =~ ^redroid/redroid:[A-Za-z0-9._-]+$ ]]; then
+            echo "redroid_image must be a redroid/redroid tag" >&2
+            exit 1
+          fi
+          if [[ ! "$WARMUP_SECONDS" =~ ^[0-9]+$ ]] \
+            || (( WARMUP_SECONDS < 15 || WARMUP_SECONDS > 180 )); then
+            echo "warmup_seconds must be between 15 and 180" >&2
+            exit 1
+          fi
+
+      - name: Install host dependencies
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y adb curl g++ git
+          if ! modinfo binder_linux >/dev/null 2>&1; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          fi
+          modinfo binder_linux >/dev/null
+
+      - name: Prepare Binder devices
+        run: |
+          set -euo pipefail
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+
+          if [[ -c /dev/binder && -c /dev/hwbinder && -c /dev/vndbinder ]]; then
+            binder_dir=/dev
+          else
+            sudo mkdir -p /dev/binderfs
+            mountpoint -q /dev/binderfs \
+              || sudo mount -t binder binder /dev/binderfs
+            binder_dir=/dev/binderfs
+          fi
+
+          for device in binder hwbinder vndbinder; do
+            test -c "$binder_dir/$device"
+            sudo chmod 666 "$binder_dir/$device"
+            stat -c '%A %U:%G %t:%T %n' "$binder_dir/$device"
+          done
+
+          echo "BINDER_DEVICE=$binder_dir/binder" >> "$GITHUB_ENV"
+          echo "HWBINDER_DEVICE=$binder_dir/hwbinder" >> "$GITHUB_ENV"
+          echo "VNDBINDER_DEVICE=$binder_dir/vndbinder" >> "$GITHUB_ENV"
+
+      - name: Download and verify APK
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          curl --fail --location \
+            --retry 5 --retry-all-errors --connect-timeout 30 \
+            --output private/target.apk "$APK_URL"
+          echo "$APK_SHA256  private/target.apk" \
+            | sha256sum --check --strict
+          test "$(stat -c '%s' private/target.apk)" = 237327095
+
+      - name: Build pinned DarkDex tools
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          git init private/darkdex
+          git -C private/darkdex remote add origin \
+            https://github.com/Krainium/DarkDex.git
+          git -C private/darkdex fetch --depth 1 origin "$DARKDEX_COMMIT"
+          git -C private/darkdex checkout --detach FETCH_HEAD
+          test "$(git -C private/darkdex rev-parse HEAD)" = "$DARKDEX_COMMIT"
+
+          g++ -O2 -std=c++17 \
+            -o private/darkdex/native/darkdex_carve \
+            private/darkdex/native/darkdex_carve.cpp
+          g++ -O2 -std=c++17 \
+            -o private/darkdex/native/darkdex_recover \
+            private/darkdex/native/darkdex_recover.cpp
+          g++ -O2 -std=c++17 \
+            -o private/darkdex/native/darkdex_intel \
+            private/darkdex/native/darkdex_intel.cpp
+
+      - name: Pull and start Redroid
+        timeout-minutes: 10
+        env:
+          REDROID_IMAGE: ${{ inputs.redroid_image }}
+        run: |
+          set -euo pipefail
+          timeout --foreground --kill-after=30s 8m \
+            docker pull "$REDROID_IMAGE"
+          docker image inspect "$REDROID_IMAGE" \
+            --format '{{json .Architecture}} {{json .Os}}'
+
+          docker run --detach --privileged --name redroid \
+            --security-opt apparmor=unconfined \
+            --security-opt seccomp=unconfined \
+            --publish 5555:5555 \
+            --volume "$BINDER_DEVICE:/dev/binder" \
+            --volume "$HWBINDER_DEVICE:/dev/hwbinder" \
+            --volume "$VNDBINDER_DEVICE:/dev/vndbinder" \
+            "$REDROID_IMAGE" \
+            androidboot.use_memfd=1 \
+            androidboot.redroid_width=720 \
+            androidboot.redroid_height=1280 \
+            androidboot.redroid_dpi=320 \
+            androidboot.redroid_gpu_mode=guest
+
+          # Docker operations after this point can block indefinitely if Redroid
+          # wedges the daemon. Readiness and diagnostics therefore use ADB only.
+          sleep 20
+
+      - name: Wait for Android
+        timeout-minutes: 7
+        run: |
+          set -uo pipefail
+          adb start-server
+          booted=
+          for attempt in $(seq 1 60); do
+            timeout 5s adb connect "$ADB_TARGET" >/dev/null 2>&1 || true
+            state="$(timeout 3s adb -s "$ADB_TARGET" get-state \
+              2>&1 || true)"
+            if [[ "$state" == device ]]; then
+              booted="$(timeout 4s adb -s "$ADB_TARGET" \
+                shell getprop sys.boot_completed 2>/dev/null \
+                | tr -d '\r' || true)"
+            else
+              booted=
+            fi
+            echo "attempt=$attempt state=[$state] boot_completed=[$booted]"
+            [[ "$booted" == 1 ]] && break
+            sleep 5
+          done
+
+          adb devices -l > private/diagnostics/adb-devices.txt
+          if [[ "$booted" != 1 ]]; then
+            echo "RESULT=ANDROID_BOOT_FAILED" \
+              > private/diagnostics/result.txt
+            exit 1
+          fi
+          echo "Android boot completed on ARM64"
+
+      - name: Install and launch app
+        timeout-minutes: 10
+        env:
+          WARMUP_SECONDS: ${{ inputs.warmup_seconds }}
+        run: |
+          set -euo pipefail
+          timeout --foreground --kill-after=30s 8m \
+            adb -s "$ADB_TARGET" install -r -g private/target.apk \
+            >/dev/null
+          adb -s "$ADB_TARGET" shell pm path "$PACKAGE" >/dev/null
+          adb -s "$ADB_TARGET" shell am force-stop "$PACKAGE"
+          adb -s "$ADB_TARGET" shell monkey \
+            -p "$PACKAGE" -c android.intent.category.LAUNCHER 1 \
+            >/dev/null
+          sleep "$WARMUP_SECONDS"
+          adb -s "$ADB_TARGET" shell ps -A \
+            | grep -F "$PACKAGE" \
+            > private/diagnostics/app-processes.txt
+          echo "Target process launched"
+
+      - name: Extract in-memory DEX files
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          target_pid=
+          largest_rss=0
+
+          for process_dir in /proc/[0-9]*; do
+            [[ -r "$process_dir/cmdline" ]] || continue
+            process_name="$(tr '\0' '\n' < "$process_dir/cmdline" \
+              2>/dev/null | head -n 1 || true)"
+            case "$process_name" in
+              "$PACKAGE"|"$PACKAGE":*) ;;
+              *) continue ;;
+            esac
+            rss="$(awk '/^VmRSS:/ {print $2; exit}' \
+              "$process_dir/status" 2>/dev/null || true)"
+            rss="${rss:-0}"
+            printf '%s\t%s\t%s kB\n' \
+              "${process_dir##*/}" "$process_name" "$rss" \
+              >> private/diagnostics/app-processes.txt
+            if (( rss > largest_rss )); then
+              largest_rss=$rss
+              target_pid="${process_dir##*/}"
+            fi
+          done
+
+          if [[ -z "$target_pid" ]]; then
+            echo "RESULT=HOST_PROCESS_NOT_FOUND" \
+              > private/diagnostics/result.txt
+            exit 1
+          fi
+          printf 'host_pid=%s rss_kb=%s\n' "$target_pid" "$largest_rss" \
+            > private/diagnostics/extraction.txt
+
+          mkdir -p private/output/dex
+          carve_rc=0
+          recover_rc=0
+          sudo private/darkdex/native/darkdex_carve \
+            "$target_pid" private/output/dex \
+            >> private/diagnostics/extraction.txt 2>&1 \
+            || carve_rc=$?
+          sudo private/darkdex/native/darkdex_recover \
+            "$target_pid" private/output/dex \
+            >> private/diagnostics/extraction.txt 2>&1 \
+            || recover_rc=$?
+          sudo private/darkdex/native/darkdex_intel \
+            "$target_pid" private/output/intel.txt \
+            >> private/diagnostics/extraction.txt 2>&1
+
+          dex_count="$(find private/output/dex -maxdepth 1 \
+            -type f -name '*.dex' | wc -l)"
+          printf 'carve_rc=%s recover_rc=%s dex_count=%s\n' \
+            "$carve_rc" "$recover_rc" "$dex_count" \
+            >> private/diagnostics/extraction.txt
+          if (( dex_count == 0 )); then
+            echo "RESULT=NO_DEX_FOUND" > private/diagnostics/result.txt
+            exit 1
+          fi
+
+          sha256sum private/output/dex/*.dex \
+            > private/output/SHA256SUMS
+          echo "RESULT=DEX_EXTRACTED count=$dex_count" \
+            > private/diagnostics/result.txt
+          echo "In-memory extraction completed"
+
+      - name: Collect private diagnostics
+        if: always()
+        run: |
+          set +e
+          timeout 5s adb connect "$ADB_TARGET" >/dev/null 2>&1
+          timeout 25s adb -s "$ADB_TARGET" logcat -d -t 3000 \
+            > private/diagnostics/android-logcat.txt 2>&1
+          sudo dmesg --ctime | tail -500 \
+            > private/diagnostics/host-dmesg.txt 2>&1
+          find private -type f -printf '%P\t%s bytes\n' \
+            > private/diagnostics/file-inventory.txt
+
+      - name: Encrypt all research output
+        if: always()
+        run: |
+          set -euo pipefail
+          test -s encryption/artifact-recipient-cert.pem
+          echo "run_id=$GITHUB_RUN_ID" \
+            > private/diagnostics/run-metadata.txt
+          echo "run_attempt=$GITHUB_RUN_ATTEMPT" \
+            >> private/diagnostics/run-metadata.txt
+          echo "head_sha=$GITHUB_SHA" \
+            >> private/diagnostics/run-metadata.txt
+
+          # The official APK and fetched tool source are reproducible inputs,
+          # not research output. Excluding them keeps the encrypted artifact small.
+          tar --create --gzip --file private/research-output.tar.gz \
+            --directory private output diagnostics
+          openssl cms -encrypt -binary -aes-256-gcm \
+            -in private/research-output.tar.gz \
+            -outform DER \
+            -out encrypted/research-output.cms \
+            encryption/artifact-recipient-cert.pem
+          sha256sum encrypted/research-output.cms \
+            > encrypted/SHA256SUMS
+          openssl cms -cmsout -inform DER \
+            -in encrypted/research-output.cms -noout
+
+          # Never let plaintext research output reach artifact upload.
+          sudo find private -type f -exec shred -u -- {} +
+          sudo find private -depth -type d -empty -delete
+          echo "Encrypted artifact created with RSA-4096 and AES-256-GCM"
+
+      - name: Upload encrypted artifact only
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: encrypted-research-${{ github.run_id }}-${{ github.run_attempt }}
+          path: encrypted/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
