@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       warmup_seconds:
-        description: Seconds to wait after launching the app
+        description: Base monitor window after launch (DarkDex also retries ~180s)
         required: true
-        default: "45"
+        default: "60"
         type: string
 
 permissions:
@@ -36,7 +36,7 @@ jobs:
           - slug: api30-x86-shell
             api_level: 30
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
       - name: Check out encryption configuration
@@ -115,17 +115,47 @@ jobs:
           25cf72115a49ff4124cc56deb41b29007f5e54708b714036ea54ed04c3445e45  private/x86-libs/lib/x86_64/libexecoat_x86.so
           EOF
 
-          # The x86 shell imports kill solely for its anti-tamper shutdown.
-          # Redirect that JUMP_SLOT to the already imported getpid symbol so
-          # the ephemeral research APK can survive its changed signature.
-          test "$(od -An -tx1 -j $((0x21dec)) -N 4 \
-            private/x86-libs/lib/x86_64/libexec_x86.so \
-            | tr -d ' \n')" = "67000000"
-          printf '\x2d\x00\x00\x00' \
-            | dd of=private/x86-libs/lib/x86_64/libexec_x86.so \
-              bs=1 seek=$((0x21dec)) conv=notrunc status=none
-          echo "3f2625c54198d8a7ba7b40e4f4b6e956d057a3dc3cf8f50cfb2648e226db5eaa  private/x86-libs/lib/x86_64/libexec_x86.so" \
+          # The re-signed x86 shell self-terminates via several imported symbols
+          # (kill/exit/abort/ptrace/android_set_abort_message). Redirect each
+          # JUMP_SLOT r_info symbol index to the already-imported getpid (45)
+          # so those PLT calls become no-op-ish getpid() instead of death.
+          # Offsets are the high 32 bits of r_info in .rela.plt (ELF64).
+          shell_so=private/x86-libs/lib/x86_64/libexec_x86.so
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+
+          path = Path("private/x86-libs/lib/x86_64/libexec_x86.so")
+          so = bytearray(path.read_bytes())
+          getpid = 45
+          # file_offset -> expected original dynsym index
+          patches = {
+              0x21DEC: 103,  # kill
+              0x219E4: 43,   # exit
+              0x221DC: 138,  # abort
+              0x2256C: 151,  # android_set_abort_message
+              0x21DBC: 108,  # ptrace
+          }
+          for off, expect in patches.items():
+              cur = struct.unpack_from("<I", so, off)[0]
+              if cur != expect:
+                  raise SystemExit(
+                      f"unexpected JUMP_SLOT at {off:#x}: {cur} != {expect}"
+                  )
+              struct.pack_into("<I", so, off, getpid)
+          path.write_bytes(so)
+          print(f"patched {len(patches)} JUMP_SLOT symbols -> getpid")
+          PY
+          echo "fc16ac75cb9cb95d16044983eec819a3124539e7b6976ea2f5bb7d9cbe5f7dd7  $shell_so" \
             | sha256sum --check --strict
+
+          # LD_PRELOAD kill-bypass for paths that resolve kill/exit via libc
+          # after load (or via dlsym). userdebug wrap.<pkg> loads it first.
+          "$toolchain/bin/x86_64-linux-android21-clang" \
+            -O2 -fPIC -shared \
+            -o private/libkillbypass.so scripts/killbypass.c
+          file private/libkillbypass.so
+          chmod 700 private/libkillbypass.so
 
           cp private/target.apk private/target-x86-unsigned.apk
           zip -q -d private/target-x86-unsigned.apk 'META-INF/*'

@@ -6,11 +6,17 @@ output="private/output"
 remote_dir="/data/local/tmp/xygj-darkdex"
 logcat_pid=""
 extractor_pid=""
+relauncher_pid=""
 
 collect_runtime_diagnostics() {
   local exit_code="$?"
   trap - EXIT
   set +e
+
+  if [[ -n "$relauncher_pid" ]]; then
+    kill "$relauncher_pid" 2>/dev/null
+    wait "$relauncher_pid" 2>/dev/null
+  fi
 
   adb devices -l > "$diagnostics/adb-devices.txt" 2>&1
   adb shell ps -A | grep -F "$PACKAGE" \
@@ -26,6 +32,8 @@ collect_runtime_diagnostics() {
   adb shell cat /proc/self/status \
     >> "$diagnostics/android-root-context.txt" 2>&1
   adb shell mount | grep -F ' /proc ' \
+    >> "$diagnostics/android-root-context.txt" 2>&1
+  adb shell getprop "wrap.${PACKAGE}" \
     >> "$diagnostics/android-root-context.txt" 2>&1
   adb pull /data/tombstones "$diagnostics/tombstones" \
     > "$diagnostics/tombstones-pull.txt" 2>&1
@@ -64,6 +72,19 @@ record_properties() {
   done
 }
 
+launch_app() {
+  local launcher_component="$1"
+  if [[ "$launcher_component" == */* ]]; then
+    timeout --foreground --kill-after=5s 30s \
+      adb shell am start -n "$launcher_component" \
+      >> "$diagnostics/app-launch.txt" 2>&1 || true
+  else
+    timeout --foreground --kill-after=5s 30s \
+      adb shell monkey -p "$PACKAGE" -c android.intent.category.LAUNCHER 1 \
+      >> "$diagnostics/app-launch.txt" 2>&1 || true
+  fi
+}
+
 record_properties > "$diagnostics/emulator-properties.txt"
 adb devices -l > "$diagnostics/adb-devices.txt"
 
@@ -97,15 +118,29 @@ adb push private/libdd "$remote_dir/libdd" \
   > "$diagnostics/extractor-push.txt" 2>&1
 adb shell chmod 700 "$remote_dir/libdd"
 
+# Optional LD_PRELOAD kill-bypass for the re-signed shell. userdebug
+# emulators honor wrap.<package> and load the library before JNI_OnLoad.
+if [[ -f private/libkillbypass.so ]]; then
+  adb push private/libkillbypass.so "$remote_dir/libkillbypass.so" \
+    >> "$diagnostics/extractor-push.txt" 2>&1
+  adb shell chmod 755 "$remote_dir/libkillbypass.so"
+  adb shell "cat > '$remote_dir/wrap.sh' <<'WRAP'
+#!/system/bin/sh
+export LD_PRELOAD=$remote_dir/libkillbypass.so
+exec \"\$@\"
+WRAP
+chmod 755 '$remote_dir/wrap.sh'"
+  # Property value must be a single token; quote for spaces-free path.
+  adb shell setprop "wrap.${PACKAGE}" "$remote_dir/wrap.sh" \
+    > "$diagnostics/wrap-property.txt" 2>&1 || true
+  printf 'wrap_enabled=1\n' >> "$diagnostics/wrap-property.txt"
+else
+  printf 'wrap_enabled=0\n' > "$diagnostics/wrap-property.txt"
+fi
+
 adb logcat -c
 adb logcat -v threadtime > "$diagnostics/android-logcat.txt" 2>&1 &
 logcat_pid="$!"
-
-extract_rc=0
-timeout --foreground --kill-after=30s 8m \
-  adb shell "$remote_dir/libdd '$PACKAGE' '$remote_dir/dex'" \
-  > "$diagnostics/extraction.txt" 2>&1 &
-extractor_pid="$!"
 
 adb shell am force-stop "$PACKAGE"
 adb shell cmd package resolve-activity --brief \
@@ -115,33 +150,65 @@ adb shell cmd package resolve-activity --brief \
 
 launcher_component="$(tr -d '\r' \
   < "$diagnostics/launcher-activity.txt" | tail -n 1)"
-if [[ "$launcher_component" == */* ]]; then
-  # Waiting for a fully drawn activity deadlocks while the extractor freezes
-  # the process with ptrace. The non-waiting start only needs AMS acceptance.
-  timeout --foreground --kill-after=5s 30s \
-    adb shell am start -n "$launcher_component" \
-    > "$diagnostics/app-launch.txt" 2>&1 || true
-else
-  timeout --foreground --kill-after=5s 30s \
-    adb shell monkey -p "$PACKAGE" -c android.intent.category.LAUNCHER 1 \
-    > "$diagnostics/app-launch.txt" 2>&1 || true
-fi
+
+: > "$diagnostics/app-launch.txt"
+launch_app "$launcher_component"
+
+# Keep relaunching while the shell anti-tamper still wins races. DarkDex
+# itself waits for a stable PID and retries across generations.
+(
+  for ((i = 0; i < WARMUP_SECONDS + 120; i++)); do
+    pid="$(adb shell pidof "$PACKAGE" 2>/dev/null | tr -d '\r' || true)"
+    if [[ -z "$pid" ]]; then
+      launch_app "$launcher_component"
+    fi
+    sleep 1
+  done
+) > "$diagnostics/relauncher.txt" 2>&1 &
+relauncher_pid="$!"
+
+extract_rc=0
+timeout --foreground --kill-after=30s 8m \
+  adb shell "$remote_dir/libdd '$PACKAGE' '$remote_dir/dex'" \
+  > "$diagnostics/extraction.txt" 2>&1 &
+extractor_pid="$!"
 
 process_seen=0
 : > "$diagnostics/app-process-timeline.txt"
-for ((second = 0; second < WARMUP_SECONDS; second++)); do
+# Cover DarkDex's multi-attempt budget (~180s) plus a little slack.
+monitor_seconds=$((WARMUP_SECONDS + 150))
+if (( monitor_seconds > 240 )); then
+  monitor_seconds=240
+fi
+for ((second = 0; second < monitor_seconds; second++)); do
   pid="$(adb shell pidof "$PACKAGE" 2>/dev/null | tr -d '\r' || true)"
   printf 'second=%s pid=%s\n' "$second" "$pid" \
     >> "$diagnostics/app-process-timeline.txt"
   if [[ -n "$pid" ]]; then
     process_seen=1
   fi
+  # Stop early once extractor exits successfully.
+  if ! kill -0 "$extractor_pid" 2>/dev/null; then
+    printf 'second=%s extractor_exited\n' "$second" \
+      >> "$diagnostics/app-process-timeline.txt"
+    break
+  fi
   sleep 1
 done
 
 wait "$extractor_pid" || extract_rc=$?
+extractor_pid=""
 printf 'extract_rc=%s\n' "$extract_rc" \
   >> "$diagnostics/extraction.txt"
+
+if [[ -n "$relauncher_pid" ]]; then
+  kill "$relauncher_pid" 2>/dev/null || true
+  wait "$relauncher_pid" 2>/dev/null || true
+  relauncher_pid=""
+fi
+
+# Clear wrap so subsequent local debugging is not surprised.
+adb shell setprop "wrap.${PACKAGE}" "" >/dev/null 2>&1 || true
 
 mkdir -p "$output"
 adb pull "$remote_dir/dex" "$output/" \

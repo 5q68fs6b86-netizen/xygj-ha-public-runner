@@ -23,3 +23,12 @@ Recipient certificate SHA-256 fingerprint:
 
 Artifacts are retained for one day. The official APK is downloaded by the runner,
 verified against a pinned SHA-256 digest, and excluded from the artifact.
+
+## Unpacking workflow notes
+
+`unpack-apk.yml` repackages the vendor x86 shell, redirects several anti-tamper
+JUMP_SLOT imports (`kill` / `exit` / `abort` / `ptrace` /
+`android_set_abort_message`) to `getpid`, optionally injects an LD_PRELOAD
+kill-bypass via `wrap.<package>`, and runs a DarkDex build that waits for a
+stable PID and retries across process generations. All of that is CI-only
+ephemeral research tooling.
