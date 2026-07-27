@@ -1,16 +1,17 @@
 --- darkdex_dump.cpp
 +++ darkdex_dump.cpp
-@@ -8,6 +8,9 @@
+@@ -8,6 +8,10 @@
  #include <fcntl.h>
  #include <unistd.h>
  #include <dirent.h>
 +#include <cerrno>
 +#include <sys/ptrace.h>
 +#include <sys/wait.h>
++#include <cctype>
  static const uint8_t DEXM[4]={0x64,0x65,0x78,0x0a}, CDEXM[4]={0x63,0x64,0x65,0x78};
  #pragma pack(push,1)
  struct MapItem{uint16_t type;uint16_t un;uint32_t size;uint32_t off;};
-@@ -22,17 +25,109 @@
+@@ -22,21 +26,168 @@
  static uint32_t carve_size(const uint8_t*p,size_t a){if(a<0x70)return 0;if(*(uint32_t*)(p+40)!=0x12345678u)return 0;
   uint32_t fs=*(uint32_t*)(p+32),hs=*(uint32_t*)(p+36);if(hs<0x28||hs>0x200)return 0;if(fs<hs||fs>96u*1024*1024)return 0;return fs;}
  
@@ -61,6 +62,47 @@
 + return strstr(comm,pkg)!=nullptr;
 +}
 +
++// Skip framework/system mappings so WrapperInit / boot image DEXes are not
++// reported as application payloads.
++static int is_framework_map(const char*path){
++ if(!path||!path[0])return 0; // anonymous: keep (ijiami often decrypts here)
++ if(strstr(path,"/system/"))return 1;
++ if(strstr(path,"/apex/"))return 1;
++ if(strstr(path,"/vendor/"))return 1;
++ if(strstr(path,"/product/"))return 1;
++ if(strstr(path,"boot.art"))return 1;
++ if(strstr(path,"boot.oat"))return 1;
++ if(strstr(path,"boot-framework"))return 1;
++ if(strstr(path,"framework.jar"))return 1;
++ if(strstr(path,"/dev/ashmem/dalvik"))return 1;
++ return 0;
++}
++
++static int has_business_marker(const std::set<std::string>&classes,
++                               const std::set<std::string>&hosts,
++                               const std::set<std::string>&packer,
++                               const std::set<std::string>&urls){
++ if(!packer.empty())return 1;
++ static const char*keys[]={
++  "yueme","chinatelecom","smarthome","ehome","21cn","xy_guanjia",
++  "ijiami","uyumao","secneo","getDeviceList","ZJ_Get","libexec",nullptr};
++ for(auto&c:classes){
++  std::string low=c;for(char&ch:low)ch=(char)tolower((unsigned char)ch);
++  for(int i=0;keys[i];i++)if(low.find(keys[i])!=std::string::npos)return 1;
++ }
++ for(auto&h:hosts){
++  std::string low=h;for(char&ch:low)ch=(char)tolower((unsigned char)ch);
++  if(low.find("ehome")!=std::string::npos||low.find("21cn")!=std::string::npos
++     ||low.find("smarthome")!=std::string::npos||low.find("189")!=std::string::npos)return 1;
++ }
++ for(auto&u:urls){
++  std::string low=u;for(char&ch:low)ch=(char)tolower((unsigned char)ch);
++  if(low.find("ehome")!=std::string::npos||low.find("21cn")!=std::string::npos
++     ||low.find("smarthome")!=std::string::npos)return 1;
++ }
++ return 0;
++}
++
 +// Wait until the package has the same PID for settle_ms, or timeout.
 +static int wait_stable_pid(const char*pkg,int timeout_ms,int settle_ms){
 + int stable_pid=-1,stable_for=0,elapsed=0;
@@ -100,12 +142,14 @@
 - char mpath[256];snprintf(mpath,256,"/proc/%d/maps",pid);FILE*mf=fopen(mpath,"r");if(!mf)return 3;
 - std::vector<uint8_t> buf;char line[1024];int dex=0,rec=0;std::set<std::string> seenC;std::set<std::string> seenR;
 + // The re-signed shell often SIGKILLs itself within ~1s. Retry across many
-+ // process generations until a DEX carve succeeds or the budget is spent.
++ // process generations until a business DEX carve succeeds or budget is spent.
 + const int total_budget_ms=180000;
 + const int settle_ms=800;
 + const int per_try_timeout_ms=20000;
++ // After the PID is stable, give the packer time to decrypt payloads.
++ const int post_stable_warm_ms=5000;
 + int budget_left=total_budget_ms;
-+ int attempt=0,best_dex=0,best_rec=0;
++ int attempt=0,best_dex=0,best_rec=0,best_biz=0;
   std::set<std::string> urls,hosts,classes,packer,cfgs;
 + while(budget_left>0){
 +  attempt++;
@@ -115,45 +159,90 @@
 +   printf("DARKDEX_ERR attempt=%d target not running: %s budget_left_ms=%d\n",attempt,pkg,budget_left);
 +   continue;
 +  }
-+  if(!pid_still_alive(pid,pkg)){
-+   printf("DARKDEX_WARN attempt=%d pid=%d died before open\n",attempt,pid);
-+   continue;
++  // Warm window for in-memory decrypt; abort if the process dies mid-wait.
++  int warmed=0;
++  while(warmed<post_stable_warm_ms){
++   if(!pid_still_alive(pid,pkg)){printf("DARKDEX_WARN attempt=%d pid=%d died during warm\n",attempt,pid);break;}
++   usleep(200000);warmed+=200;
 +  }
-+  printf("DARKDEX target=%s pid=%d out=%s attempt=%d\n",pkg,pid,out,attempt);
++  if(!pid_still_alive(pid,pkg))continue;
++  printf("DARKDEX target=%s pid=%d out=%s attempt=%d warm_ms=%d\n",pkg,pid,out,attempt,warmed);
 +  int fd=open_target_memory(pid);if(fd<0){printf("DARKDEX_WARN attempt=%d open memory failed\n",attempt);continue;}
 +  char mpath[256];snprintf(mpath,256,"/proc/%d/maps",pid);FILE*mf=fopen(mpath,"r");
 +  if(!mf){close(fd);detach_target();printf("DARKDEX_WARN attempt=%d open maps failed\n",attempt);continue;}
 +  std::vector<uint8_t> buf;char line[1024];int dex=0,rec=0;std::set<std::string> seenC;std::set<std::string> seenR;
++  // Per-attempt intel buckets (merged into globals on interesting hits).
++  std::set<std::string> a_urls,a_hosts,a_classes,a_packer,a_cfgs;
++  int maps_total=0,maps_skip_fw=0,maps_scan=0;
  
   while(fgets(line,sizeof line,mf)){
-   uint64_t s,e;char perms[8]={0};if(sscanf(line,"%lx-%lx %7s",&s,&e,perms)!=3)continue;
-@@ -79,12 +174,26 @@
-    else if(!memcmp(B+i,"\"appId\"",7)||!memcmp(B+i,"\"apkVersion\"",12)){size_t j=i;std::string c;while(j<(size_t)n&&B[j]>=0x20&&B[j]<0x7f&&c.size()<160){c+=(char)B[j];j++;}cfgs.insert(c);i=j;}
+-  uint64_t s,e;char perms[8]={0};if(sscanf(line,"%lx-%lx %7s",&s,&e,perms)!=3)continue;
+-  if(perms[0]!='r')continue;uint64_t sz=e-s;if(sz==0||sz>900ULL*1024*1024)continue;
++  uint64_t s,e;char perms[8]={0};char path[512]={0};
++  int nfield=sscanf(line,"%lx-%lx %7s %*s %*s %*s %511[^\n]",&s,&e,perms,path);
++  if(nfield<3)continue;
++  maps_total++;
++  if(perms[0]!='r')continue;
++  if(is_framework_map(path)){maps_skip_fw++;continue;}
++  maps_scan++;
++  uint64_t sz=e-s;if(sz==0||sz>900ULL*1024*1024)continue;
+   buf.resize(sz);ssize_t n=pread(fd,buf.data(),sz,s);if(n<=0)continue;const uint8_t*B=buf.data();
+ 
+   for(size_t i=0;i+0x70<=(size_t)n;i+=4){
+@@ -71,20 +222,48 @@
+ 
+   for(size_t i=0;i+8<(size_t)n;i++){
+    if(!memcmp(B+i,"http",4)&&(!memcmp(B+i,"http://",7)||!memcmp(B+i,"https://",8))){size_t j=i;std::string u;
+-    while(j<(size_t)n&&urlc(B[j])&&u.size()<256){u+=(char)B[j];j++;}if(u.size()>10){urls.insert(u);
+-     size_t h=u.find("//");if(h!=std::string::npos){size_t k=u.find('/',h+2);hosts.insert(u.substr(h+2,(k==std::string::npos?u.size():k)-h-2));}}i=j;}
++    while(j<(size_t)n&&urlc(B[j])&&u.size()<256){u+=(char)B[j];j++;}if(u.size()>10){a_urls.insert(u);urls.insert(u);
++     size_t h=u.find("//");if(h!=std::string::npos){size_t k=u.find('/',h+2);std::string ho=u.substr(h+2,(k==std::string::npos?u.size():k)-h-2);a_hosts.insert(ho);hosts.insert(ho);}}i=j;}
+    else if(B[i]=='L'&&(!memcmp(B+i,"Lcom/",5)||!memcmp(B+i,"Lcn/",4)||!memcmp(B+i,"Lio/",4)||!memcmp(B+i,"Lorg/",5))){
+     size_t j=i+1;std::string c;while(j<(size_t)n&&(isalnum(B[j])||B[j]=='/'||B[j]=='_'||B[j]=='$')&&c.size()<120){c+=(char)B[j];j++;}
+-    if(j<(size_t)n&&B[j]==';'&&c.size()>6){if(c.find("ijiami")!=std::string::npos||c.find("uyumao")!=std::string::npos||c.find("secneo")!=std::string::npos)packer.insert(c);else classes.insert(c);}i=j;}
+-   else if(!memcmp(B+i,"\"appId\"",7)||!memcmp(B+i,"\"apkVersion\"",12)){size_t j=i;std::string c;while(j<(size_t)n&&B[j]>=0x20&&B[j]<0x7f&&c.size()<160){c+=(char)B[j];j++;}cfgs.insert(c);i=j;}
++    if(j<(size_t)n&&B[j]==';'&&c.size()>6){
++     if(c.find("ijiami")!=std::string::npos||c.find("uyumao")!=std::string::npos||c.find("secneo")!=std::string::npos){a_packer.insert(c);packer.insert(c);}
++     else {a_classes.insert(c);classes.insert(c);}
++    }i=j;}
++   else if(!memcmp(B+i,"\"appId\"",7)||!memcmp(B+i,"\"apkVersion\"",12)){size_t j=i;std::string c;while(j<(size_t)n&&B[j]>=0x20&&B[j]<0x7f&&c.size()<160){c+=(char)B[j];j++;}a_cfgs.insert(c);cfgs.insert(c);i=j;}
    }
   }
 - fclose(mf);close(fd);
 +  fclose(mf);close(fd);detach_target();
-+  printf("DARKDEX_ATTEMPT attempt=%d pid=%d dex=%d recovered=%d\n",attempt,pid,dex,rec);
++  int biz=has_business_marker(a_classes,a_hosts,a_packer,a_urls);
++  printf("DARKDEX_ATTEMPT attempt=%d pid=%d dex=%d recovered=%d biz=%d maps_total=%d maps_skip_fw=%d maps_scan=%d\n",
++         attempt,pid,dex,rec,biz,maps_total,maps_skip_fw,maps_scan);
 +  if(dex>best_dex)best_dex=dex;
 +  if(rec>best_rec)best_rec=rec;
-+  if(dex>0){
++  if(biz)best_biz=1;
++  // Only treat as success when business markers are present. Framework-only
++  // carves (e.g. from wrap/WrapperInit preloads) must not short-circuit.
++  if((dex>0||rec>0) && biz){
 +   char ip[640];snprintf(ip,640,"%s/intel.txt",out);FILE*io=fopen(ip,"w");
-+   if(io){fprintf(io,"# darkdex intel %s pid %d attempt %d\n## PACKER\n",pkg,pid,attempt);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
++   if(io){fprintf(io,"# darkdex intel %s pid %d attempt %d biz=1\n## PACKER\n",pkg,pid,attempt);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
 +    fprintf(io,"## HOSTS\n");int z=0;for(auto&x:hosts){if(z++>120)break;fprintf(io,"  %s\n",x.c_str());}
 +    fprintf(io,"## CONFIG\n");for(auto&x:cfgs)fprintf(io,"  %s\n",x.c_str());
 +    fprintf(io,"## CLASSES(%zu)\n",classes.size());z=0;for(auto&x:classes){if(z++>400)break;fprintf(io,"  %s\n",x.c_str());}fclose(io);}
-+   printf("DARKDEX_DONE dex=%d recovered=%d urls=%zu classes=%zu packer=%zu attempts=%d\n",dex,rec,urls.size(),classes.size(),packer.size(),attempt);
++   printf("DARKDEX_DONE dex=%d recovered=%d urls=%zu classes=%zu packer=%zu attempts=%d biz=1\n",dex,rec,urls.size(),classes.size(),packer.size(),attempt);
 +   return 0;
++  }
++  // Drop framework-only carves so the next attempt starts clean.
++  if((dex>0||rec>0) && !biz){
++   printf("DARKDEX_WARN attempt=%d discarding framework-only carves dex=%d rec=%d\n",attempt,dex,rec);
++   char cmd[768];snprintf(cmd,sizeof(cmd),"rm -f '%s'/carve_*.dex '%s'/recovered_*.dex",out,out);
++   system(cmd);
 +  }
 +  usleep(300000);
 + }
   char ip[640];snprintf(ip,640,"%s/intel.txt",out);FILE*io=fopen(ip,"w");
 - if(io){fprintf(io,"# darkdex intel %s pid %d\n## PACKER\n",pkg,pid);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
-+ if(io){fprintf(io,"# darkdex intel %s no-dex attempts=%d best_dex=%d\n## PACKER\n",pkg,attempt,best_dex);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
++ if(io){fprintf(io,"# darkdex intel %s no-biz-dex attempts=%d best_dex=%d best_biz=%d\n## PACKER\n",pkg,attempt,best_dex,best_biz);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
    fprintf(io,"## HOSTS\n");int z=0;for(auto&x:hosts){if(z++>120)break;fprintf(io,"  %s\n",x.c_str());}
    fprintf(io,"## CONFIG\n");for(auto&x:cfgs)fprintf(io,"  %s\n",x.c_str());
    fprintf(io,"## CLASSES(%zu)\n",classes.size());z=0;for(auto&x:classes){if(z++>400)break;fprintf(io,"  %s\n",x.c_str());}fclose(io);}
 - printf("DARKDEX_DONE dex=%d recovered=%d urls=%zu classes=%zu packer=%zu\n",dex,rec,urls.size(),classes.size(),packer.size());
-+ printf("DARKDEX_DONE dex=%d recovered=%d urls=%zu classes=%zu packer=%zu attempts=%d\n",best_dex,best_rec,urls.size(),classes.size(),packer.size(),attempt);
-  return 0;
+- return 0;
++ printf("DARKDEX_DONE dex=%d recovered=%d urls=%zu classes=%zu packer=%zu attempts=%d biz=%d\n",best_dex,best_rec,urls.size(),classes.size(),packer.size(),attempt,best_biz);
++ return best_biz?0:4;
  }

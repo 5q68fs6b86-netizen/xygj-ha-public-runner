@@ -118,24 +118,18 @@ adb push private/libdd "$remote_dir/libdd" \
   > "$diagnostics/extractor-push.txt" 2>&1
 adb shell chmod 700 "$remote_dir/libdd"
 
-# Optional LD_PRELOAD kill-bypass for the re-signed shell. userdebug
-# emulators honor wrap.<package> and load the library before JNI_OnLoad.
+# Do NOT enable wrap.<package>. On userdebug, wrap forces WrapperInit which
+# re-preloads the entire boot image into the app process; DarkDex then carves
+# framework DEX and reports a false DEX_EXTRACTED. Survival comes from the
+# JUMP_SLOT multi-patch on libexec_x86.so instead.
+adb shell setprop "wrap.${PACKAGE}" "" >/dev/null 2>&1 || true
+printf 'wrap_enabled=0 reason=wrapperinit_framework_pollution\n' \
+  > "$diagnostics/wrap-property.txt"
+# Keep the preload library on device for optional manual experiments only.
 if [[ -f private/libkillbypass.so ]]; then
   adb push private/libkillbypass.so "$remote_dir/libkillbypass.so" \
-    >> "$diagnostics/extractor-push.txt" 2>&1
-  adb shell chmod 755 "$remote_dir/libkillbypass.so"
-  adb shell "cat > '$remote_dir/wrap.sh' <<'WRAP'
-#!/system/bin/sh
-export LD_PRELOAD=$remote_dir/libkillbypass.so
-exec \"\$@\"
-WRAP
-chmod 755 '$remote_dir/wrap.sh'"
-  # Property value must be a single token; quote for spaces-free path.
-  adb shell setprop "wrap.${PACKAGE}" "$remote_dir/wrap.sh" \
-    > "$diagnostics/wrap-property.txt" 2>&1 || true
-  printf 'wrap_enabled=1\n' >> "$diagnostics/wrap-property.txt"
-else
-  printf 'wrap_enabled=0\n' > "$diagnostics/wrap-property.txt"
+    >> "$diagnostics/extractor-push.txt" 2>&1 || true
+  adb shell chmod 755 "$remote_dir/libkillbypass.so" || true
 fi
 
 adb logcat -c
@@ -216,9 +210,28 @@ adb pull "$remote_dir/dex" "$output/" \
 dex_count="$(find "$output" -type f -name '*.dex' | wc -l)"
 printf 'dex_count=%s\n' "$dex_count" \
   >> "$diagnostics/extraction.txt"
-if (( dex_count == 0 )); then
+
+# Reject framework-only carves: require business markers in intel or strings.
+biz_hit=0
+if [[ -f "$output/dex/intel.txt" ]]; then
+  if grep -Eiq 'yueme|chinatelecom|smarthome|ehome|21cn|xy_guanjia|ijiami|uyumao|secneo|getDeviceList|ZJ_Get' \
+      "$output/dex/intel.txt"; then
+    biz_hit=1
+  fi
+fi
+if (( biz_hit == 0 && dex_count > 0 )); then
+  if grep -REaiq 'yueme|chinatelecom|smarthome|ehome\.21cn|xy_guanjia|ijiami' \
+      "$output/dex" --include='*.dex'; then
+    biz_hit=1
+  fi
+fi
+printf 'biz_hit=%s\n' "$biz_hit" >> "$diagnostics/extraction.txt"
+
+if (( dex_count == 0 || biz_hit == 0 )); then
   if (( process_seen == 0 )); then
     set_result "APP_PROCESS_NOT_RUNNING"
+  elif (( dex_count > 0 && biz_hit == 0 )); then
+    set_result "FRAMEWORK_DEX_ONLY count=$dex_count"
   else
     set_result "NO_DEX_FOUND"
   fi
@@ -227,4 +240,4 @@ fi
 
 find "$output" -type f -name '*.dex' \
   -exec sha256sum {} + > "$output/SHA256SUMS"
-set_result "DEX_EXTRACTED count=$dex_count"
+set_result "DEX_EXTRACTED count=$dex_count biz=1"

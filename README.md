@@ -26,9 +26,11 @@ verified against a pinned SHA-256 digest, and excluded from the artifact.
 
 ## Unpacking workflow notes
 
-`unpack-apk.yml` repackages the vendor x86 shell, redirects several anti-tamper
+`unpack-apk.yml` repackages the vendor x86 shell and redirects anti-tamper
 JUMP_SLOT imports (`kill` / `exit` / `abort` / `ptrace` /
-`android_set_abort_message`) to `getpid`, optionally injects an LD_PRELOAD
-kill-bypass via `wrap.<package>`, and runs a DarkDex build that waits for a
-stable PID and retries across process generations. All of that is CI-only
-ephemeral research tooling.
+`android_set_abort_message`) to `getpid`. DarkDex waits for a stable PID,
+skips `/system`/`/apex` maps, warms ~5s for decrypt, and only treats carves
+as success when business markers appear (not boot-image framework DEX).
+`wrap.<package>` is intentionally disabled: it triggers WrapperInit and
+pollutes the process with framework DEX. All of this is CI-only research
+tooling.
