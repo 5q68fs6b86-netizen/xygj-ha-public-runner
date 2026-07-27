@@ -11,7 +11,7 @@
  static const uint8_t DEXM[4]={0x64,0x65,0x78,0x0a}, CDEXM[4]={0x63,0x64,0x65,0x78};
  #pragma pack(push,1)
  struct MapItem{uint16_t type;uint16_t un;uint32_t size;uint32_t off;};
-@@ -22,21 +26,183 @@
+@@ -22,21 +26,186 @@
  static uint32_t carve_size(const uint8_t*p,size_t a){if(a<0x70)return 0;if(*(uint32_t*)(p+40)!=0x12345678u)return 0;
   uint32_t fs=*(uint32_t*)(p+32),hs=*(uint32_t*)(p+36);if(hs<0x28||hs>0x200)return 0;if(fs<hs||fs>96u*1024*1024)return 0;return fs;}
  
@@ -204,12 +204,15 @@
 +  maps_total++;
 +  if(perms[0]!='r')continue;
 +  if(is_framework_map(path)){maps_skip_fw++;continue;}
++  if(path[0] && (strstr(path,"libexec")||strstr(path,"/data/app")||strstr(path,"ijm")||strstr(path,"yueme"))){
++   printf("DARKDEX_SCAN_PATH %s\n",path);
++  }
 +  maps_scan++;
 +  uint64_t sz=e-s;if(sz==0||sz>900ULL*1024*1024)continue;
    buf.resize(sz);ssize_t n=pread(fd,buf.data(),sz,s);if(n<=0)continue;const uint8_t*B=buf.data();
  
    for(size_t i=0;i+0x70<=(size_t)n;i+=4){
-@@ -71,20 +237,88 @@
+@@ -71,20 +240,92 @@
  
    for(size_t i=0;i+8<(size_t)n;i++){
     if(!memcmp(B+i,"http",4)&&(!memcmp(B+i,"http://",7)||!memcmp(B+i,"https://",8))){size_t j=i;std::string u;
@@ -236,7 +239,7 @@
 + int ready_now=maps_look_ready(pid);
 + printf("DARKDEX_ATTEMPT attempt=%d pid=%d dex=%d recovered=%d biz=%d maps_total=%d maps_skip_fw=%d maps_scan=%d ready=%d\n",
 +        attempt,pid,dex,rec,biz,maps_total,maps_skip_fw,maps_scan,ready_now);
-+ if(!ready_now && (attempt<=2 || attempt%3==0)) dump_maps_paths(pid,attempt);
++ if(ready_now || attempt<=2 || attempt%3==0) dump_maps_paths(pid,attempt);
 + *out_dex=dex;*out_rec=rec;
 + if((dex>0||rec>0) && biz){
 +  char ip[640];snprintf(ip,640,"%s/intel.txt",out);FILE*io=fopen(ip,"w");
@@ -247,8 +250,12 @@
 +  return 1;
 + }
 + if((dex>0||rec>0) && !biz){
-+  printf("DARKDEX_WARN attempt=%d discarding framework-only carves dex=%d rec=%d\n",attempt,dex,rec);
-+  char cmd[768];snprintf(cmd,sizeof(cmd),"rm -f '%s'/carve_*.dex '%s'/recovered_*.dex",out,out);
++  printf("DARKDEX_WARN attempt=%d stashing framework-only carves dex=%d rec=%d\n",attempt,dex,rec);
++  char cmd[900];
++  snprintf(cmd,sizeof(cmd),
++    "mkdir -p '%s'/fw && "
++    "mv -f '%s'/carve_*.dex '%s'/recovered_*.dex '%s'/fw/ 2>/dev/null || true",
++    out,out,out,out);
 +  system(cmd);
 + }
 + return 0;

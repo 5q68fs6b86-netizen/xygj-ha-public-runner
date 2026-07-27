@@ -225,8 +225,9 @@ adb shell setprop "wrap.${PACKAGE}" "" >/dev/null 2>&1 || true
 mkdir -p "$output"
 adb pull "$remote_dir/dex" "$output/" \
   > "$diagnostics/extractor-pull.txt" 2>&1 || true
-dex_count="$(find "$output" -type f -name '*.dex' | wc -l)"
-printf 'dex_count=%s\n' "$dex_count" \
+dex_count="$(find "$output" -type f -name '*.dex' ! -path '*/fw/*' | wc -l)"
+fw_count="$(find "$output" -type f -name '*.dex' -path '*/fw/*' | wc -l)"
+printf 'dex_count=%s fw_dex_count=%s\n' "$dex_count" "$fw_count" \
   >> "$diagnostics/extraction.txt"
 
 # Reject framework-only carves: require business markers in intel or strings.
