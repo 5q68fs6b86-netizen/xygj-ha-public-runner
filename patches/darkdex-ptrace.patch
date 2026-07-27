@@ -259,10 +259,10 @@
 + const char*pkg=argv[1];const char*out=argv[2];
 + // Outer budget across process generations; inner window re-scans one living PID.
 + const int total_budget_ms=200000;
-+ const int settle_ms=600;
++ const int settle_ms=200;
 + const int per_try_timeout_ms=20000;
-+ const int live_scan_window_ms=20000;
-+ const int scan_interval_ms=1500;
++ const int live_scan_window_ms=45000;
++ const int scan_interval_ms=400;
 + int budget_left=total_budget_ms;
 + int attempt=0,best_dex=0,best_rec=0,best_biz=0;
 + std::set<std::string> urls,hosts,classes,packer,cfgs;
@@ -288,9 +288,9 @@
 +    return 0;
 +   }
 +   // Prefer scanning after app maps show up, but never block forever.
-+   if(!maps_look_ready(pid)) usleep(400000);
++   if(!maps_look_ready(pid)) usleep(200000);
 +   else usleep(scan_interval_ms*1000);
-+   lived+= (maps_look_ready(pid)?scan_interval_ms:400);
++   lived+= (maps_look_ready(pid)?scan_interval_ms:200);
 +   // Re-resolve pid in case of recycle with same package.
 +   int cur=find_pid(pkg);
 +   if(cur>0 && cur!=pid){printf("DARKDEX_WARN pid changed %d -> %d\n",pid,cur);pid=cur;}

@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <string.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -58,8 +59,33 @@ static int is_deadly_nr(long number) {
  * no-ops. Covers UPX-unpacked direct `syscall` instructions that never
  * hit PLT or the libc syscall() wrapper.
  */
+/* Anti-tamper after a blocked self-kill often raises SIGILL/SIGTRAP in
+ * anonymous (UPX) code. Swallow those so attachBaseContext can continue.
+ * SIGKILL cannot be caught — seccomp must keep blocking it.
+ */
+static void ignore_signal(int sig) {
+  (void)sig;
+}
+
+static void install_signal_guards(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = ignore_signal;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART;
+  sigaction(SIGILL, &sa, NULL);
+  sigaction(SIGTRAP, &sa, NULL);
+  sigaction(SIGABRT, &sa, NULL);
+  sigaction(SIGBUS, &sa, NULL);
+  sigaction(SIGFPE, &sa, NULL);
+  sigaction(SIGSYS, &sa, NULL);
+  sigaction(SIGPIPE, &sa, NULL);
+}
+
 static void install_seccomp_guard(void) __attribute__((constructor(101)));
 static void install_seccomp_guard(void) {
+  install_signal_guards();
+
   struct sock_filter filter[] = {
       /* 0: load arch */
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
