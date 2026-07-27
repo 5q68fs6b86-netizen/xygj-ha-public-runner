@@ -11,10 +11,21 @@
  static const uint8_t DEXM[4]={0x64,0x65,0x78,0x0a}, CDEXM[4]={0x63,0x64,0x65,0x78};
  #pragma pack(push,1)
  struct MapItem{uint16_t type;uint16_t un;uint32_t size;uint32_t off;};
-@@ -22,21 +26,198 @@
+@@ -22,21 +26,155 @@
  static uint32_t carve_size(const uint8_t*p,size_t a){if(a<0x70)return 0;if(*(uint32_t*)(p+40)!=0x12345678u)return 0;
   uint32_t fs=*(uint32_t*)(p+32),hs=*(uint32_t*)(p+36);if(hs<0x28||hs>0x200)return 0;if(fs<hs||fs>96u*1024*1024)return 0;return fs;}
  
+-int main(int argc,char**argv){
+- if(argc<3){fprintf(stderr,"usage: %s <package> <outdir>\n",argv[0]);return 1;}
+- const char*pkg=argv[1];const char*out=argv[2];
+- int pid=-1; for(int _t=0;_t<30&&pid<=0;_t++){pid=find_pid(pkg); if(pid<=0)sleep(1);} if(pid>0)sleep(8);
+- if(pid<=0){printf("DARKDEX_ERR target not running: %s\n",pkg);return 2;}
+- printf("DARKDEX target=%s pid=%d out=%s\n",pkg,pid,out);
+- char mp[256];snprintf(mp,256,"/proc/%d/mem",pid);int fd=open(mp,O_RDONLY);
+- if(fd<0){printf("DARKDEX_ERR open mem failed (need root)\n");return 3;}
+- char mpath[256];snprintf(mpath,256,"/proc/%d/maps",pid);FILE*mf=fopen(mpath,"r");if(!mf)return 3;
+- std::vector<uint8_t> buf;char line[1024];int dex=0,rec=0;std::set<std::string> seenC;std::set<std::string> seenR;
+- std::set<std::string> urls,hosts,classes,packer,cfgs;
 +static int attached_pid=-1;
 +static void detach_target(){
 + if(attached_pid<=0)return;
@@ -61,9 +72,7 @@
 + comm[n]=0;for(size_t i=0;i<n;i++)if(comm[i]==0)comm[i]=' ';
 + return strstr(comm,pkg)!=nullptr;
 +}
-+
-+// Skip framework/system mappings so WrapperInit / boot image DEXes are not
-+// reported as application payloads. Anonymous maps are kept (packer decrypt).
+ 
 +static int is_framework_map(const char*path){
 + if(!path||!path[0])return 0;
 + if(strstr(path,"/system/"))return 1;
@@ -78,14 +87,14 @@
 + return 0;
 +}
 +
-+// True when the process has mapped the installed APK / native shell — i.e.
-+// past pure Zygote WrapperInit class preload into real app code loading.
 +static int maps_look_ready(int pid){
 + char mpath[256],line[1024];
 + snprintf(mpath,sizeof(mpath),"/proc/%d/maps",pid);
 + FILE*mf=fopen(mpath,"r");if(!mf)return 0;
 + int ready=0;
-+ while(fgets(line,sizeof line,mf)){
+  while(fgets(line,sizeof line,mf)){
+-  uint64_t s,e;char perms[8]={0};if(sscanf(line,"%lx-%lx %7s",&s,&e,perms)!=3)continue;
+-  if(perms[0]!='r')continue;uint64_t sz=e-s;if(sz==0||sz>900ULL*1024*1024)continue;
 +  if(strstr(line,"/data/app/")||strstr(line,"libexec")||strstr(line,"base.apk")){
 +   ready=1;break;
 +  }
@@ -99,7 +108,7 @@
 +                               const std::set<std::string>&urls){
 + if(!packer.empty())return 1;
 + static const char*keys[]={
-+  "yueme","chinatelecom","smarthome","ehome","21cn","xy_guanjia",
++  "chinatelecom","smarthome","ehome","21cn","xy_guanjia",
 +  "ijiami","uyumao","secneo","getDeviceList","ZJ_Get","libexec",nullptr};
 + for(auto&c:classes){
 +  std::string low=c;for(char&ch:low)ch=(char)tolower((unsigned char)ch);
@@ -145,69 +154,21 @@
 + return -1;
 +}
 +
-+// Wait until maps show app code, with a hard ceiling so short-lived shells
-+// still get scanned.
-+static int wait_app_ready(int pid,const char*pkg,int timeout_ms){
-+ int elapsed=0;
-+ while(elapsed<timeout_ms){
-+  if(!pid_still_alive(pid,pkg))return 0;
-+  if(maps_look_ready(pid)){
-+   // Extra decrypt window after app code appears.
-+   int extra=0;
-+   while(extra<2000){
-+    if(!pid_still_alive(pid,pkg))return 0;
-+    usleep(200000);extra+=200;
-+   }
-+   printf("DARKDEX_READY pid=%d ready_ms=%d extra_ms=%d\n",pid,elapsed,extra);
-+   return 1;
-+  }
-+  usleep(200000);elapsed+=200;
-+ }
-+ printf("DARKDEX_WARN ready timeout pid=%d waited_ms=%d (scanning anyway)\n",pid,timeout_ms);
-+ return pid_still_alive(pid,pkg);
-+}
++// One memory carve pass. Returns 1 if business DEX written.
++static int carve_once(int pid,const char*pkg,const char*out,int attempt,
++                      int*out_dex,int*out_rec,
++                      std::set<std::string>&urls,std::set<std::string>&hosts,
++                      std::set<std::string>&classes,std::set<std::string>&packer,
++                      std::set<std::string>&cfgs){
++ if(!pid_still_alive(pid,pkg))return 0;
++ int fd=open_target_memory(pid);if(fd<0)return 0;
++ char mpath[256];snprintf(mpath,256,"/proc/%d/maps",pid);FILE*mf=fopen(mpath,"r");
++ if(!mf){close(fd);detach_target();return 0;}
++ std::vector<uint8_t> buf;char line[1024];int dex=0,rec=0;
++ std::set<std::string> seenC,seenR,a_urls,a_hosts,a_classes,a_packer,a_cfgs;
++ int maps_total=0,maps_skip_fw=0,maps_scan=0;
 +
- int main(int argc,char**argv){
-  if(argc<3){fprintf(stderr,"usage: %s <package> <outdir>\n",argv[0]);return 1;}
-  const char*pkg=argv[1];const char*out=argv[2];
-- int pid=-1; for(int _t=0;_t<30&&pid<=0;_t++){pid=find_pid(pkg); if(pid<=0)sleep(1);} if(pid>0)sleep(8);
-- if(pid<=0){printf("DARKDEX_ERR target not running: %s\n",pkg);return 2;}
-- printf("DARKDEX target=%s pid=%d out=%s\n",pkg,pid,out);
-- char mp[256];snprintf(mp,256,"/proc/%d/mem",pid);int fd=open(mp,O_RDONLY);
-- if(fd<0){printf("DARKDEX_ERR open mem failed (need root)\n");return 3;}
-- char mpath[256];snprintf(mpath,256,"/proc/%d/maps",pid);FILE*mf=fopen(mpath,"r");if(!mf)return 3;
-- std::vector<uint8_t> buf;char line[1024];int dex=0,rec=0;std::set<std::string> seenC;std::set<std::string> seenR;
-+ const int total_budget_ms=200000;
-+ const int settle_ms=800;
-+ const int per_try_timeout_ms=25000;
-+ const int ready_timeout_ms=35000;
-+ int budget_left=total_budget_ms;
-+ int attempt=0,best_dex=0,best_rec=0,best_biz=0;
-  std::set<std::string> urls,hosts,classes,packer,cfgs;
-+ while(budget_left>0){
-+  attempt++;
-+  int pid=wait_stable_pid(pkg, per_try_timeout_ms, settle_ms);
-+  budget_left-=per_try_timeout_ms;
-+  if(pid<=0){
-+   printf("DARKDEX_ERR attempt=%d target not running: %s budget_left_ms=%d\n",attempt,pkg,budget_left);
-+   continue;
-+  }
-+  if(!wait_app_ready(pid,pkg,ready_timeout_ms)){
-+   printf("DARKDEX_WARN attempt=%d pid=%d not ready / died before scan\n",attempt,pid);
-+   continue;
-+  }
-+  if(!pid_still_alive(pid,pkg))continue;
-+  printf("DARKDEX target=%s pid=%d out=%s attempt=%d\n",pkg,pid,out,attempt);
-+  int fd=open_target_memory(pid);if(fd<0){printf("DARKDEX_WARN attempt=%d open memory failed\n",attempt);continue;}
-+  char mpath[256];snprintf(mpath,256,"/proc/%d/maps",pid);FILE*mf=fopen(mpath,"r");
-+  if(!mf){close(fd);detach_target();printf("DARKDEX_WARN attempt=%d open maps failed\n",attempt);continue;}
-+  std::vector<uint8_t> buf;char line[1024];int dex=0,rec=0;std::set<std::string> seenC;std::set<std::string> seenR;
-+  std::set<std::string> a_urls,a_hosts,a_classes,a_packer,a_cfgs;
-+  int maps_total=0,maps_skip_fw=0,maps_scan=0;
- 
-  while(fgets(line,sizeof line,mf)){
--  uint64_t s,e;char perms[8]={0};if(sscanf(line,"%lx-%lx %7s",&s,&e,perms)!=3)continue;
--  if(perms[0]!='r')continue;uint64_t sz=e-s;if(sz==0||sz>900ULL*1024*1024)continue;
++ while(fgets(line,sizeof line,mf)){
 +  uint64_t s,e;char perms[8]={0};char path[512]={0};
 +  int nfield=sscanf(line,"%lx-%lx %7s %*s %*s %*s %511[^\n]",&s,&e,perms,path);
 +  if(nfield<3)continue;
@@ -219,7 +180,7 @@
    buf.resize(sz);ssize_t n=pread(fd,buf.data(),sz,s);if(n<=0)continue;const uint8_t*B=buf.data();
  
    for(size_t i=0;i+0x70<=(size_t)n;i+=4){
-@@ -71,20 +252,45 @@
+@@ -71,20 +209,86 @@
  
    for(size_t i=0;i+8<(size_t)n;i++){
     if(!memcmp(B+i,"http",4)&&(!memcmp(B+i,"http://",7)||!memcmp(B+i,"https://",8))){size_t j=i;std::string u;
@@ -236,32 +197,73 @@
 +     else {a_classes.insert(c);classes.insert(c);}
 +    }i=j;}
 +   else if(!memcmp(B+i,"\"appId\"",7)||!memcmp(B+i,"\"apkVersion\"",12)){size_t j=i;std::string c;while(j<(size_t)n&&B[j]>=0x20&&B[j]<0x7f&&c.size()<160){c+=(char)B[j];j++;}a_cfgs.insert(c);cfgs.insert(c);i=j;}
++  }
++ }
++ fclose(mf);close(fd);detach_target();
++ int biz=has_business_marker(a_classes,a_hosts,a_packer,a_urls);
++ printf("DARKDEX_ATTEMPT attempt=%d pid=%d dex=%d recovered=%d biz=%d maps_total=%d maps_skip_fw=%d maps_scan=%d ready=%d\n",
++        attempt,pid,dex,rec,biz,maps_total,maps_skip_fw,maps_scan,maps_look_ready(pid));
++ *out_dex=dex;*out_rec=rec;
++ if((dex>0||rec>0) && biz){
++  char ip[640];snprintf(ip,640,"%s/intel.txt",out);FILE*io=fopen(ip,"w");
++  if(io){fprintf(io,"# darkdex intel %s pid %d attempt %d biz=1\n## PACKER\n",pkg,pid,attempt);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
++   fprintf(io,"## HOSTS\n");int z=0;for(auto&x:hosts){if(z++>120)break;fprintf(io,"  %s\n",x.c_str());}
++   fprintf(io,"## CONFIG\n");for(auto&x:cfgs)fprintf(io,"  %s\n",x.c_str());
++   fprintf(io,"## CLASSES(%zu)\n",classes.size());z=0;for(auto&x:classes){if(z++>400)break;fprintf(io,"  %s\n",x.c_str());}fclose(io);}
++  return 1;
++ }
++ if((dex>0||rec>0) && !biz){
++  printf("DARKDEX_WARN attempt=%d discarding framework-only carves dex=%d rec=%d\n",attempt,dex,rec);
++  char cmd[768];snprintf(cmd,sizeof(cmd),"rm -f '%s'/carve_*.dex '%s'/recovered_*.dex",out,out);
++  system(cmd);
++ }
++ return 0;
++}
++
++int main(int argc,char**argv){
++ if(argc<3){fprintf(stderr,"usage: %s <package> <outdir>\n",argv[0]);return 1;}
++ const char*pkg=argv[1];const char*out=argv[2];
++ // Outer budget across process generations; inner window re-scans one living PID.
++ const int total_budget_ms=200000;
++ const int settle_ms=600;
++ const int per_try_timeout_ms=20000;
++ const int live_scan_window_ms=20000;
++ const int scan_interval_ms=1500;
++ int budget_left=total_budget_ms;
++ int attempt=0,best_dex=0,best_rec=0,best_biz=0;
++ std::set<std::string> urls,hosts,classes,packer,cfgs;
++ while(budget_left>0){
++  attempt++;
++  int pid=wait_stable_pid(pkg, per_try_timeout_ms, settle_ms);
++  budget_left-=per_try_timeout_ms;
++  if(pid<=0){
++   printf("DARKDEX_ERR attempt=%d target not running: %s budget_left_ms=%d\n",attempt,pkg,budget_left);
++   continue;
    }
++  printf("DARKDEX target=%s pid=%d out=%s attempt=%d\n",pkg,pid,out,attempt);
++  int lived=0;
++  while(lived<live_scan_window_ms && pid_still_alive(pid,pkg)){
++   int dex=0,rec=0;
++   int hit=carve_once(pid,pkg,out,attempt,&dex,&rec,urls,hosts,classes,packer,cfgs);
++   if(dex>best_dex)best_dex=dex;
++   if(rec>best_rec)best_rec=rec;
++   if(hit){
++    best_biz=1;
++    printf("DARKDEX_DONE dex=%d recovered=%d urls=%zu classes=%zu packer=%zu attempts=%d biz=1\n",
++           dex,rec,urls.size(),classes.size(),packer.size(),attempt);
++    return 0;
++   }
++   // Prefer scanning after app maps show up, but never block forever.
++   if(!maps_look_ready(pid)) usleep(400000);
++   else usleep(scan_interval_ms*1000);
++   lived+= (maps_look_ready(pid)?scan_interval_ms:400);
++   // Re-resolve pid in case of recycle with same package.
++   int cur=find_pid(pkg);
++   if(cur>0 && cur!=pid){printf("DARKDEX_WARN pid changed %d -> %d\n",pid,cur);pid=cur;}
++  }
++  usleep(200000);
   }
 - fclose(mf);close(fd);
-+  fclose(mf);close(fd);detach_target();
-+  int biz=has_business_marker(a_classes,a_hosts,a_packer,a_urls);
-+  printf("DARKDEX_ATTEMPT attempt=%d pid=%d dex=%d recovered=%d biz=%d maps_total=%d maps_skip_fw=%d maps_scan=%d\n",
-+         attempt,pid,dex,rec,biz,maps_total,maps_skip_fw,maps_scan);
-+  if(dex>best_dex)best_dex=dex;
-+  if(rec>best_rec)best_rec=rec;
-+  if(biz)best_biz=1;
-+  if((dex>0||rec>0) && biz){
-+   char ip[640];snprintf(ip,640,"%s/intel.txt",out);FILE*io=fopen(ip,"w");
-+   if(io){fprintf(io,"# darkdex intel %s pid %d attempt %d biz=1\n## PACKER\n",pkg,pid,attempt);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
-+    fprintf(io,"## HOSTS\n");int z=0;for(auto&x:hosts){if(z++>120)break;fprintf(io,"  %s\n",x.c_str());}
-+    fprintf(io,"## CONFIG\n");for(auto&x:cfgs)fprintf(io,"  %s\n",x.c_str());
-+    fprintf(io,"## CLASSES(%zu)\n",classes.size());z=0;for(auto&x:classes){if(z++>400)break;fprintf(io,"  %s\n",x.c_str());}fclose(io);}
-+   printf("DARKDEX_DONE dex=%d recovered=%d urls=%zu classes=%zu packer=%zu attempts=%d biz=1\n",dex,rec,urls.size(),classes.size(),packer.size(),attempt);
-+   return 0;
-+  }
-+  if((dex>0||rec>0) && !biz){
-+   printf("DARKDEX_WARN attempt=%d discarding framework-only carves dex=%d rec=%d\n",attempt,dex,rec);
-+   char cmd[768];snprintf(cmd,sizeof(cmd),"rm -f '%s'/carve_*.dex '%s'/recovered_*.dex",out,out);
-+   system(cmd);
-+  }
-+  usleep(300000);
-+ }
   char ip[640];snprintf(ip,640,"%s/intel.txt",out);FILE*io=fopen(ip,"w");
 - if(io){fprintf(io,"# darkdex intel %s pid %d\n## PACKER\n",pkg,pid);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
 + if(io){fprintf(io,"# darkdex intel %s no-biz-dex attempts=%d best_dex=%d best_biz=%d\n## PACKER\n",pkg,attempt,best_dex,best_biz);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
