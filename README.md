@@ -29,8 +29,8 @@ verified against a pinned SHA-256 digest, and excluded from the artifact.
 `unpack-apk.yml` repackages the vendor x86 shell and redirects anti-tamper
 JUMP_SLOT imports (`kill` / `exit` / `abort` / `ptrace` /
 `android_set_abort_message`) to `getpid`. A `wrap.<package>` LD_PRELOAD
-kill-bypass is also set so the process survives long enough past Zygote
-WrapperInit. DarkDex waits until `/data/app` maps appear, skips
-`/system`/`/apex` maps, and only treats carves as success when business
-markers appear (not boot-image framework DEX). All of this is CI-only
-research tooling.
+also stubs kill helpers and `setuid`/`setgid` family calls: without the
+latter, WrapperInit dies with `SIGSYS` (seccomp blocks syscall 106 /
+`setgid` during AssetManager idmap verification). DarkDex waits until
+`/data/app` maps appear, skips `/system`/`/apex` maps, and only treats
+carves as success when business markers appear. CI-only research tooling.

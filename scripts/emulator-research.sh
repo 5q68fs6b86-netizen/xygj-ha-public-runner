@@ -223,15 +223,17 @@ printf 'dex_count=%s\n' "$dex_count" \
   >> "$diagnostics/extraction.txt"
 
 # Reject framework-only carves: require business markers in intel or strings.
+# Reject framework-only carves: require business markers stronger than the
+# package name itself (intel header always contains com.yueme.itv).
 biz_hit=0
 if [[ -f "$output/dex/intel.txt" ]]; then
-  if grep -Eiq 'yueme|chinatelecom|smarthome|ehome|21cn|xy_guanjia|ijiami|uyumao|secneo|getDeviceList|ZJ_Get' \
+  if grep -Eiq 'chinatelecom|smarthome|ehome\.|ehome/|21cn|xy_guanjia|ijiami|uyumao|secneo|getDeviceList|ZJ_Get|libexec' \
       "$output/dex/intel.txt"; then
     biz_hit=1
   fi
 fi
 if (( biz_hit == 0 && dex_count > 0 )); then
-  if grep -REaiq 'yueme|chinatelecom|smarthome|ehome\.21cn|xy_guanjia|ijiami' \
+  if grep -REaiq 'chinatelecom|smarthome|ehome\.21cn|xy_guanjia|ijiami|getDeviceList|ZJ_GetDevice' \
       "$output/dex" --include='*.dex'; then
     biz_hit=1
   fi

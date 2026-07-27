@@ -154,7 +154,7 @@
 +  if(maps_look_ready(pid)){
 +   // Extra decrypt window after app code appears.
 +   int extra=0;
-+   while(extra<4000){
++   while(extra<2000){
 +    if(!pid_still_alive(pid,pkg))return 0;
 +    usleep(200000);extra+=200;
 +   }
