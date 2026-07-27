@@ -11,7 +11,7 @@
  static const uint8_t DEXM[4]={0x64,0x65,0x78,0x0a}, CDEXM[4]={0x63,0x64,0x65,0x78};
  #pragma pack(push,1)
  struct MapItem{uint16_t type;uint16_t un;uint32_t size;uint32_t off;};
-@@ -22,21 +26,168 @@
+@@ -22,21 +26,198 @@
  static uint32_t carve_size(const uint8_t*p,size_t a){if(a<0x70)return 0;if(*(uint32_t*)(p+40)!=0x12345678u)return 0;
   uint32_t fs=*(uint32_t*)(p+32),hs=*(uint32_t*)(p+36);if(hs<0x28||hs>0x200)return 0;if(fs<hs||fs>96u*1024*1024)return 0;return fs;}
  
@@ -63,9 +63,9 @@
 +}
 +
 +// Skip framework/system mappings so WrapperInit / boot image DEXes are not
-+// reported as application payloads.
++// reported as application payloads. Anonymous maps are kept (packer decrypt).
 +static int is_framework_map(const char*path){
-+ if(!path||!path[0])return 0; // anonymous: keep (ijiami often decrypts here)
++ if(!path||!path[0])return 0;
 + if(strstr(path,"/system/"))return 1;
 + if(strstr(path,"/apex/"))return 1;
 + if(strstr(path,"/vendor/"))return 1;
@@ -76,6 +76,21 @@
 + if(strstr(path,"framework.jar"))return 1;
 + if(strstr(path,"/dev/ashmem/dalvik"))return 1;
 + return 0;
++}
++
++// True when the process has mapped the installed APK / native shell — i.e.
++// past pure Zygote WrapperInit class preload into real app code loading.
++static int maps_look_ready(int pid){
++ char mpath[256],line[1024];
++ snprintf(mpath,sizeof(mpath),"/proc/%d/maps",pid);
++ FILE*mf=fopen(mpath,"r");if(!mf)return 0;
++ int ready=0;
++ while(fgets(line,sizeof line,mf)){
++  if(strstr(line,"/data/app/")||strstr(line,"libexec")||strstr(line,"base.apk")){
++   ready=1;break;
++  }
++ }
++ fclose(mf);return ready;
 +}
 +
 +static int has_business_marker(const std::set<std::string>&classes,
@@ -103,7 +118,6 @@
 + return 0;
 +}
 +
-+// Wait until the package has the same PID for settle_ms, or timeout.
 +static int wait_stable_pid(const char*pkg,int timeout_ms,int settle_ms){
 + int stable_pid=-1,stable_for=0,elapsed=0;
 + while(elapsed<timeout_ms){
@@ -131,6 +145,28 @@
 + return -1;
 +}
 +
++// Wait until maps show app code, with a hard ceiling so short-lived shells
++// still get scanned.
++static int wait_app_ready(int pid,const char*pkg,int timeout_ms){
++ int elapsed=0;
++ while(elapsed<timeout_ms){
++  if(!pid_still_alive(pid,pkg))return 0;
++  if(maps_look_ready(pid)){
++   // Extra decrypt window after app code appears.
++   int extra=0;
++   while(extra<4000){
++    if(!pid_still_alive(pid,pkg))return 0;
++    usleep(200000);extra+=200;
++   }
++   printf("DARKDEX_READY pid=%d ready_ms=%d extra_ms=%d\n",pid,elapsed,extra);
++   return 1;
++  }
++  usleep(200000);elapsed+=200;
++ }
++ printf("DARKDEX_WARN ready timeout pid=%d waited_ms=%d (scanning anyway)\n",pid,timeout_ms);
++ return pid_still_alive(pid,pkg);
++}
++
  int main(int argc,char**argv){
   if(argc<3){fprintf(stderr,"usage: %s <package> <outdir>\n",argv[0]);return 1;}
   const char*pkg=argv[1];const char*out=argv[2];
@@ -141,13 +177,10 @@
 - if(fd<0){printf("DARKDEX_ERR open mem failed (need root)\n");return 3;}
 - char mpath[256];snprintf(mpath,256,"/proc/%d/maps",pid);FILE*mf=fopen(mpath,"r");if(!mf)return 3;
 - std::vector<uint8_t> buf;char line[1024];int dex=0,rec=0;std::set<std::string> seenC;std::set<std::string> seenR;
-+ // The re-signed shell often SIGKILLs itself within ~1s. Retry across many
-+ // process generations until a business DEX carve succeeds or budget is spent.
-+ const int total_budget_ms=180000;
++ const int total_budget_ms=200000;
 + const int settle_ms=800;
-+ const int per_try_timeout_ms=20000;
-+ // After the PID is stable, give the packer time to decrypt payloads.
-+ const int post_stable_warm_ms=5000;
++ const int per_try_timeout_ms=25000;
++ const int ready_timeout_ms=35000;
 + int budget_left=total_budget_ms;
 + int attempt=0,best_dex=0,best_rec=0,best_biz=0;
   std::set<std::string> urls,hosts,classes,packer,cfgs;
@@ -159,19 +192,16 @@
 +   printf("DARKDEX_ERR attempt=%d target not running: %s budget_left_ms=%d\n",attempt,pkg,budget_left);
 +   continue;
 +  }
-+  // Warm window for in-memory decrypt; abort if the process dies mid-wait.
-+  int warmed=0;
-+  while(warmed<post_stable_warm_ms){
-+   if(!pid_still_alive(pid,pkg)){printf("DARKDEX_WARN attempt=%d pid=%d died during warm\n",attempt,pid);break;}
-+   usleep(200000);warmed+=200;
++  if(!wait_app_ready(pid,pkg,ready_timeout_ms)){
++   printf("DARKDEX_WARN attempt=%d pid=%d not ready / died before scan\n",attempt,pid);
++   continue;
 +  }
 +  if(!pid_still_alive(pid,pkg))continue;
-+  printf("DARKDEX target=%s pid=%d out=%s attempt=%d warm_ms=%d\n",pkg,pid,out,attempt,warmed);
++  printf("DARKDEX target=%s pid=%d out=%s attempt=%d\n",pkg,pid,out,attempt);
 +  int fd=open_target_memory(pid);if(fd<0){printf("DARKDEX_WARN attempt=%d open memory failed\n",attempt);continue;}
 +  char mpath[256];snprintf(mpath,256,"/proc/%d/maps",pid);FILE*mf=fopen(mpath,"r");
 +  if(!mf){close(fd);detach_target();printf("DARKDEX_WARN attempt=%d open maps failed\n",attempt);continue;}
 +  std::vector<uint8_t> buf;char line[1024];int dex=0,rec=0;std::set<std::string> seenC;std::set<std::string> seenR;
-+  // Per-attempt intel buckets (merged into globals on interesting hits).
 +  std::set<std::string> a_urls,a_hosts,a_classes,a_packer,a_cfgs;
 +  int maps_total=0,maps_skip_fw=0,maps_scan=0;
  
@@ -189,7 +219,7 @@
    buf.resize(sz);ssize_t n=pread(fd,buf.data(),sz,s);if(n<=0)continue;const uint8_t*B=buf.data();
  
    for(size_t i=0;i+0x70<=(size_t)n;i+=4){
-@@ -71,20 +222,48 @@
+@@ -71,20 +252,45 @@
  
    for(size_t i=0;i+8<(size_t)n;i++){
     if(!memcmp(B+i,"http",4)&&(!memcmp(B+i,"http://",7)||!memcmp(B+i,"https://",8))){size_t j=i;std::string u;
@@ -216,8 +246,6 @@
 +  if(dex>best_dex)best_dex=dex;
 +  if(rec>best_rec)best_rec=rec;
 +  if(biz)best_biz=1;
-+  // Only treat as success when business markers are present. Framework-only
-+  // carves (e.g. from wrap/WrapperInit preloads) must not short-circuit.
 +  if((dex>0||rec>0) && biz){
 +   char ip[640];snprintf(ip,640,"%s/intel.txt",out);FILE*io=fopen(ip,"w");
 +   if(io){fprintf(io,"# darkdex intel %s pid %d attempt %d biz=1\n## PACKER\n",pkg,pid,attempt);for(auto&x:packer)fprintf(io,"  %s\n",x.c_str());
@@ -227,7 +255,6 @@
 +   printf("DARKDEX_DONE dex=%d recovered=%d urls=%zu classes=%zu packer=%zu attempts=%d biz=1\n",dex,rec,urls.size(),classes.size(),packer.size(),attempt);
 +   return 0;
 +  }
-+  // Drop framework-only carves so the next attempt starts clean.
 +  if((dex>0||rec>0) && !biz){
 +   printf("DARKDEX_WARN attempt=%d discarding framework-only carves dex=%d rec=%d\n",attempt,dex,rec);
 +   char cmd[768];snprintf(cmd,sizeof(cmd),"rm -f '%s'/carve_*.dex '%s'/recovered_*.dex",out,out);

@@ -118,18 +118,29 @@ adb push private/libdd "$remote_dir/libdd" \
   > "$diagnostics/extractor-push.txt" 2>&1
 adb shell chmod 700 "$remote_dir/libdd"
 
-# Do NOT enable wrap.<package>. On userdebug, wrap forces WrapperInit which
-# re-preloads the entire boot image into the app process; DarkDex then carves
-# framework DEX and reports a false DEX_EXTRACTED. Survival comes from the
-# JUMP_SLOT multi-patch on libexec_x86.so instead.
-adb shell setprop "wrap.${PACKAGE}" "" >/dev/null 2>&1 || true
-printf 'wrap_enabled=0 reason=wrapperinit_framework_pollution\n' \
-  > "$diagnostics/wrap-property.txt"
-# Keep the preload library on device for optional manual experiments only.
+# wrap.<package> is required for survival: JUMP_SLOT multi-patch alone still
+# loses the <1s suicide race. wrap forces WrapperInit (slow boot preload),
+# which keeps the process alive long enough for shell + packer to run.
+# DarkDex now waits until /data/app maps appear and skips /system carves so
+# the preload itself is not mistaken for business DEX.
 if [[ -f private/libkillbypass.so ]]; then
   adb push private/libkillbypass.so "$remote_dir/libkillbypass.so" \
-    >> "$diagnostics/extractor-push.txt" 2>&1 || true
-  adb shell chmod 755 "$remote_dir/libkillbypass.so" || true
+    >> "$diagnostics/extractor-push.txt" 2>&1
+  adb shell chmod 755 "$remote_dir/libkillbypass.so"
+  adb shell "cat > '$remote_dir/wrap.sh' <<'WRAP'
+#!/system/bin/sh
+export LD_PRELOAD=$remote_dir/libkillbypass.so
+exec \"\$@\"
+WRAP
+chmod 755 '$remote_dir/wrap.sh'"
+  adb shell setprop "wrap.${PACKAGE}" "$remote_dir/wrap.sh" \
+    > "$diagnostics/wrap-property.txt" 2>&1 || true
+  printf 'wrap_enabled=1 mode=survive_plus_filter\n' \
+    >> "$diagnostics/wrap-property.txt"
+else
+  adb shell setprop "wrap.${PACKAGE}" "" >/dev/null 2>&1 || true
+  printf 'wrap_enabled=0 reason=no_libkillbypass\n' \
+    > "$diagnostics/wrap-property.txt"
 fi
 
 adb logcat -c
