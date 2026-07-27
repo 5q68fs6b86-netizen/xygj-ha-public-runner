@@ -1,22 +1,30 @@
 /*
  * Ephemeral CI LD_PRELOAD for the re-signed x86 shell.
  *
- * - kill/tgkill/raise: anti-tamper self-termination
+ * - kill/tgkill/raise: anti-tamper self-termination (PLT)
  * - setuid/setgid family: WrapperInit AssetManager idmap (seccomp SIGSYS)
- * - syscall(): shell bypasses PLT kill/exit via raw syscall numbers
- * - _exit/_Exit: direct termination that skips atexit/PLT exit
+ * - syscall(): shell bypasses PLT kill/exit via libc syscall()
+ * - _exit/_Exit: return instead of terminating (do NOT pause — freezes boot)
+ * - seccomp-bpf constructor: block raw syscall insn for kill/exit_group
+ *   (UPX-packed shell issues these directly after unpack; PLT patches miss them)
  *
  * Built on the Actions NDK runner; never ships to users.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stddef.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <grp.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 
 #ifndef SYS_kill
 #define SYS_kill 62
@@ -34,9 +42,62 @@
 #define SYS_exit_group 231
 #endif
 
+#ifndef SECCOMP_MODE_FILTER
+#define SECCOMP_MODE_FILTER 2
+#endif
+#ifndef PR_SET_NO_NEW_PRIVS
+#define PR_SET_NO_NEW_PRIVS 38
+#endif
+
 static int is_deadly_nr(long number) {
   return number == SYS_kill || number == SYS_tkill || number == SYS_tgkill
       || number == SYS_exit || number == SYS_exit_group;
+}
+
+/* Install a process-wide filter that turns deadly syscalls into errno=0
+ * no-ops. Covers UPX-unpacked direct `syscall` instructions that never
+ * hit PLT or the libc syscall() wrapper.
+ */
+static void install_seccomp_guard(void) __attribute__((constructor(101)));
+static void install_seccomp_guard(void) {
+  struct sock_filter filter[] = {
+      /* 0: load arch */
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+      /* 1: allow only x86_64 */
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+      /* 2: bad arch -> allow (don't brick the process) */
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+      /* 3: load nr */
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+      /* 4.. : deadly -> ERRNO(0) */
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_exit_group, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_exit, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_kill, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_tgkill, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_tkill, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+  struct sock_fprog prog = {
+      .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+      .filter = filter,
+  };
+
+  /* Best-effort: failure must not prevent the rest of the preload. */
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+    return;
+  }
+  if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
+    /* Some emulators already have a filter; try syscall form with TSYNC. */
+#ifdef __NR_seccomp
+    syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+            1 /* SECCOMP_FILTER_FLAG_TSYNC */, &prog);
+#endif
+  }
 }
 
 int kill(pid_t pid, int sig) {
@@ -71,8 +132,7 @@ int raise(int sig) {
 
 /* Direct _exit bypasses atexit and our exit() PLT patch.
  * Must NOT block: a forever-pause freezes WrapperInit on the main
- * thread and the shell never reaches attachBaseContext. Returning
- * lets the anti-tamper path fall through so loading can continue.
+ * thread and the shell never reaches attachBaseContext.
  */
 void _exit(int status) {
   (void)status;

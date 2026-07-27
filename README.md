@@ -34,6 +34,9 @@ and redirects anti-tamper JUMP_SLOT imports (`kill` / `exit` / `abort` /
 LD_PRELOAD also stubs kill helpers, `syscall(SYS_kill|exit*)`, `_exit`,
 and `setuid`/`setgid` family calls: without the latter, WrapperInit dies
 with `SIGSYS` (seccomp blocks syscall 106 / `setgid` during AssetManager
-idmap verification). DarkDex waits until app/shell maps appear, skips
-`/system`/`/apex` maps, and only treats carves as success when business
-markers appear. CI-only research tooling.
+idmap verification). A constructor also installs a seccomp-bpf filter
+that turns raw `kill`/`exit_group` syscalls into errno no-ops — required
+because the UPX-packed shell issues those via direct syscall instructions
+after unpack, bypassing PLT and `syscall()`. DarkDex waits until app/shell
+maps appear, skips `/system`/`/apex` maps, and only treats carves as
+success when business markers appear. CI-only research tooling.
