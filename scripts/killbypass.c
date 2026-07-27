@@ -7,6 +7,10 @@
  * - _exit/_Exit: return instead of terminating (do NOT pause — freezes boot)
  * - seccomp-bpf constructor: block raw syscall insn for kill/exit_group
  *   (UPX-packed shell issues these directly after unpack; PLT patches miss them)
+ * - SIGSEGV/SIGILL/…: after kill is blocked the shell null-derefs in UPX
+ *   anonymous code (fault addr 0x2c8/0x358/…). Re-point the null base
+ *   register at a RW fake object and re-execute so attachBaseContext can
+ *   finish decrypting business DEX.
  *
  * Built on the Actions NDK runner; never ships to users.
  */
@@ -17,10 +21,12 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 #include <grp.h>
 #include <linux/audit.h>
@@ -55,24 +61,65 @@ static int is_deadly_nr(long number) {
       || number == SYS_exit || number == SYS_exit_group;
 }
 
-/* Install a process-wide filter that turns deadly syscalls into errno=0
- * no-ops. Covers UPX-unpacked direct `syscall` instructions that never
- * hit PLT or the libc syscall() wrapper.
- */
-/* Anti-tamper after a blocked self-kill often raises SIGILL/SIGTRAP in
- * anonymous (UPX) code. Swallow those so attachBaseContext can continue.
- * SIGKILL cannot be caught — seccomp must keep blocking it.
- */
-static void ignore_signal(int sig) {
+/* Large enough for the observed null-page offsets (0x2c8..0x358). */
+static unsigned char g_fake_obj[0x2000];
+static volatile unsigned long g_sig_fix = 0;
+static volatile unsigned long g_sig_fixed = 0;
+static volatile unsigned long g_sig_skipped = 0;
+
+static int fix_null_base_reg(ucontext_t *uc, void *fault_addr) {
+  uintptr_t fault = (uintptr_t)fault_addr;
+  if (fault >= 0x10000ul) {
+    return 0;
+  }
+
+  /* Candidate GPRs that may hold the null object base. */
+  const int regs[] = {
+      REG_RAX, REG_RBX, REG_RCX, REG_RDX, REG_RSI, REG_RDI,
+      REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13,
+      REG_R14, REG_R15, REG_RBP,
+  };
+
+  for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+    greg_t *slot = &uc->uc_mcontext.gregs[regs[i]];
+    uintptr_t base = (uintptr_t)(*slot);
+    /* Classic `mov reg, [reg+off]` with reg==NULL and off==fault. */
+    if (base < 0x10000ul && fault >= base && (fault - base) < sizeof(g_fake_obj)) {
+      *slot = (greg_t)(uintptr_t)g_fake_obj;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void crash_guard(int sig, siginfo_t *si, void *ctx) {
+  ucontext_t *uc = (ucontext_t *)ctx;
+  g_sig_fix++;
+
+  if (sig == SIGSEGV || sig == SIGBUS) {
+    if (fix_null_base_reg(uc, si ? si->si_addr : NULL)) {
+      g_sig_fixed++;
+      return; /* re-execute with non-null base */
+    }
+  }
+
+  /* Fall back: skip forward so we do not tight-loop on the same insn.
+   * x86_64 lengths vary; 4 bytes clears many short loads/calls. If we
+   * land mid-instruction the next fault will skip again. */
+  uc->uc_mcontext.gregs[REG_RIP] += 4;
+  g_sig_skipped++;
   (void)sig;
 }
 
 static void install_signal_guards(void) {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
-  sa.sa_handler = ignore_signal;
+  sa.sa_sigaction = crash_guard;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_RESTART;
+  /* NODEFER: nested faults during the handler still come back to us.
+   * RESTART: keep blocking syscalls restartable where possible. */
+  sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_RESTART;
+  sigaction(SIGSEGV, &sa, NULL);
   sigaction(SIGILL, &sa, NULL);
   sigaction(SIGTRAP, &sa, NULL);
   sigaction(SIGABRT, &sa, NULL);
@@ -82,8 +129,15 @@ static void install_signal_guards(void) {
   sigaction(SIGPIPE, &sa, NULL);
 }
 
+/* Install a process-wide filter that turns deadly syscalls into errno=0
+ * no-ops. Covers UPX-unpacked direct `syscall` instructions that never
+ * hit PLT or the libc syscall() wrapper.
+ */
 static void install_seccomp_guard(void) __attribute__((constructor(101)));
 static void install_seccomp_guard(void) {
+  /* Pre-touch fake object so the first fault does not page-fault again. */
+  memset(g_fake_obj, 0, sizeof(g_fake_obj));
+
   install_signal_guards();
 
   struct sock_filter filter[] = {

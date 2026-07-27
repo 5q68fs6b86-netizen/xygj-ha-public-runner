@@ -11,7 +11,7 @@
  static const uint8_t DEXM[4]={0x64,0x65,0x78,0x0a}, CDEXM[4]={0x63,0x64,0x65,0x78};
  #pragma pack(push,1)
  struct MapItem{uint16_t type;uint16_t un;uint32_t size;uint32_t off;};
-@@ -22,21 +26,186 @@
+@@ -22,21 +26,187 @@
  static uint32_t carve_size(const uint8_t*p,size_t a){if(a<0x70)return 0;if(*(uint32_t*)(p+40)!=0x12345678u)return 0;
   uint32_t fs=*(uint32_t*)(p+32),hs=*(uint32_t*)(p+36);if(hs<0x28||hs>0x200)return 0;if(fs<hs||fs>96u*1024*1024)return 0;return fs;}
  
@@ -195,7 +195,7 @@
 + if(!mf){close(fd);detach_target();return 0;}
 + std::vector<uint8_t> buf;char line[1024];int dex=0,rec=0;
 + std::set<std::string> seenC,seenR,a_urls,a_hosts,a_classes,a_packer,a_cfgs;
-+ int maps_total=0,maps_skip_fw=0,maps_scan=0;
++ int maps_total=0,maps_skip_fw=0,maps_scan=0; int seen_hot=0;
 +
 + while(fgets(line,sizeof line,mf)){
 +  uint64_t s,e;char perms[8]={0};char path[512]={0};
@@ -206,13 +206,14 @@
 +  if(is_framework_map(path)){maps_skip_fw++;continue;}
 +  if(path[0] && (strstr(path,"libexec")||strstr(path,"/data/app")||strstr(path,"ijm")||strstr(path,"yueme"))){
 +   printf("DARKDEX_SCAN_PATH %s\n",path);
++   seen_hot++;
 +  }
 +  maps_scan++;
 +  uint64_t sz=e-s;if(sz==0||sz>900ULL*1024*1024)continue;
    buf.resize(sz);ssize_t n=pread(fd,buf.data(),sz,s);if(n<=0)continue;const uint8_t*B=buf.data();
  
    for(size_t i=0;i+0x70<=(size_t)n;i+=4){
-@@ -71,20 +240,92 @@
+@@ -71,20 +241,92 @@
  
    for(size_t i=0;i+8<(size_t)n;i++){
     if(!memcmp(B+i,"http",4)&&(!memcmp(B+i,"http://",7)||!memcmp(B+i,"https://",8))){size_t j=i;std::string u;
@@ -236,9 +237,9 @@
 + }
 + fclose(mf);close(fd);detach_target();
 + int biz=has_business_marker(a_classes,a_hosts,a_packer,a_urls);
-+ int ready_now=maps_look_ready(pid);
-+ printf("DARKDEX_ATTEMPT attempt=%d pid=%d dex=%d recovered=%d biz=%d maps_total=%d maps_skip_fw=%d maps_scan=%d ready=%d\n",
-+        attempt,pid,dex,rec,biz,maps_total,maps_skip_fw,maps_scan,ready_now);
++ int ready_now=maps_look_ready(pid) || (seen_hot>0);
++ printf("DARKDEX_ATTEMPT attempt=%d pid=%d dex=%d recovered=%d biz=%d maps_total=%d maps_skip_fw=%d maps_scan=%d ready=%d seen_hot=%d\n",
++        attempt,pid,dex,rec,biz,maps_total,maps_skip_fw,maps_scan,ready_now,seen_hot);
 + if(ready_now || attempt<=2 || attempt%3==0) dump_maps_paths(pid,attempt);
 + *out_dex=dex;*out_rec=rec;
 + if((dex>0||rec>0) && biz){
