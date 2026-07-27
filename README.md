@@ -38,8 +38,9 @@ idmap verification). A constructor also installs a seccomp-bpf filter
 that turns raw `kill`/`exit_group` syscalls into errno no-ops — required
 because the UPX-packed shell issues those via direct syscall instructions
 after unpack, bypassing PLT and `syscall()`. After kill is blocked the
-shell null-derefs in UPX anonymous code (fault 0x2c8/0x358); the preload
-catches SIGSEGV/SIGBUS, retargets the null base register at a fake object,
-and re-executes so decryption can continue. DarkDex waits until app/shell
+shell null-derefs in UPX anonymous code (fault 0x2c8/0x358); a *deferred*
+SIGSEGV/SIGBUS handler (post-WrapperInit preload) retargets the null base
+register at a fake object and re-executes so decryption can continue —
+never skips RIP (that stormed zygote preload for ~50s). DarkDex waits until app/shell
 maps appear, skips `/system`/`/apex` maps, and only treats carves as
 success when business markers appear. CI-only research tooling.
