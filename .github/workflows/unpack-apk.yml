@@ -95,7 +95,14 @@ jobs:
           file private/libdd
           chmod 700 private/libdd
 
-          mkdir -p private/x86-libs/lib/x86_64
+          # Vendor ships x86 shell objects under lib/arm64-v8a/*_x86.so. The stub
+          # Application (s.h.e.l.l.S / N) on x86 devices does System.loadLibrary(
+          # "exec") / "execmain" after detecting an x86 linker — NOT "exec_x86".
+          # It may also extract assets/ijm_lib/<abi>/libexec{,main}.so. Package
+          # both the canonical names and the _x86 fallbacks, plus assets copies.
+          mkdir -p private/x86-libs/lib/x86_64 \
+            private/x86-libs/assets/ijm_lib/x86_64 \
+            private/x86-libs/assets/ijm_lib/x86
           unzip -p private/target.apk \
             lib/arm64-v8a/libexec_x86.so \
             > private/x86-libs/lib/x86_64/libexec_x86.so
@@ -124,6 +131,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import struct
+          import shutil
 
           path = Path("private/x86-libs/lib/x86_64/libexec_x86.so")
           so = bytearray(path.read_bytes())
@@ -145,8 +153,34 @@ jobs:
               struct.pack_into("<I", so, off, getpid)
           path.write_bytes(so)
           print(f"patched {len(patches)} JUMP_SLOT symbols -> getpid")
+
+          root = Path("private/x86-libs")
+          # Canonical loadLibrary("exec") names used on x86 detection path.
+          mapping = {
+              "lib/x86_64/libexec_x86.so": [
+                  "lib/x86_64/libexec.so",
+                  "assets/ijm_lib/x86_64/libexec.so",
+                  "assets/ijm_lib/x86/libexec.so",
+              ],
+              "lib/x86_64/libexecmain_x86.so": [
+                  "lib/x86_64/libexecmain.so",
+                  "assets/ijm_lib/x86_64/libexecmain.so",
+                  "assets/ijm_lib/x86/libexecmain.so",
+              ],
+              "lib/x86_64/libhts_x86.so": ["lib/x86_64/libhts.so"],
+              "lib/x86_64/libexecoat_x86.so": ["lib/x86_64/libexecoat.so"],
+          }
+          for src, dests in mapping.items():
+              src_path = root / src
+              for dest in dests:
+                  dest_path = root / dest
+                  dest_path.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src_path, dest_path)
+                  print(f"published {src} -> {dest}")
           PY
           echo "fc16ac75cb9cb95d16044983eec819a3124539e7b6976ea2f5bb7d9cbe5f7dd7  $shell_so" \
+            | sha256sum --check --strict
+          echo "fc16ac75cb9cb95d16044983eec819a3124539e7b6976ea2f5bb7d9cbe5f7dd7  private/x86-libs/lib/x86_64/libexec.so" \
             | sha256sum --check --strict
 
           # LD_PRELOAD kill-bypass for paths that resolve kill/exit via libc
@@ -159,8 +193,13 @@ jobs:
 
           cp private/target.apk private/target-x86-unsigned.apk
           zip -q -d private/target-x86-unsigned.apk 'META-INF/*'
+          # Drop arm64 shell objects so the package only exposes the x86 ones we
+          # just published under lib/x86_64 and assets/ijm_lib.
+          zip -q -d private/target-x86-unsigned.apk \
+            'lib/arm64-v8a/libexec*.so' \
+            'lib/arm64-v8a/libhts*.so' || true
           (cd private/x86-libs && \
-            zip -q -0 -r ../target-x86-unsigned.apk lib)
+            zip -q -0 -r ../target-x86-unsigned.apk lib assets)
           build_tools="$(find "$ANDROID_SDK_ROOT/build-tools" \
             -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
           "$build_tools/zipalign" -f -p 4 \

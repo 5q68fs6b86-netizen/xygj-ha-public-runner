@@ -4,6 +4,7 @@
  * - kill/tgkill/raise: anti-tamper self-termination
  * - setuid/setgid family: WrapperInit AssetManager idmap (seccomp SIGSYS)
  * - syscall(): shell bypasses PLT kill/exit via raw syscall numbers
+ * - _exit/_Exit: direct termination that skips atexit/PLT exit
  *
  * Built on the Actions NDK runner; never ships to users.
  */
@@ -66,6 +67,18 @@ int pthread_kill(pthread_t thread, int sig) {
 int raise(int sig) {
   (void)sig;
   return 0;
+}
+
+/* Direct _exit bypasses atexit and our exit() PLT patch. */
+void _exit(int status) {
+  (void)status;
+  for (;;) {
+    pause();
+  }
+}
+
+void _Exit(int status) {
+  _exit(status);
 }
 
 int setgid(gid_t gid) {

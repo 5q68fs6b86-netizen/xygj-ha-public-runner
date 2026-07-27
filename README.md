@@ -26,11 +26,14 @@ verified against a pinned SHA-256 digest, and excluded from the artifact.
 
 ## Unpacking workflow notes
 
-`unpack-apk.yml` repackages the vendor x86 shell and redirects anti-tamper
-JUMP_SLOT imports (`kill` / `exit` / `abort` / `ptrace` /
-`android_set_abort_message`) to `getpid`. A `wrap.<package>` LD_PRELOAD
-also stubs kill helpers and `setuid`/`setgid` family calls: without the
-latter, WrapperInit dies with `SIGSYS` (seccomp blocks syscall 106 /
-`setgid` during AssetManager idmap verification). DarkDex waits until
-`/data/app` maps appear, skips `/system`/`/apex` maps, and only treats
-carves as success when business markers appear. CI-only research tooling.
+`unpack-apk.yml` repackages the vendor x86 shell under the names the stub
+actually loads (`libexec.so` / `libexecmain.so` via `loadLibrary("exec")`,
+plus `assets/ijm_lib/{x86,x86_64}/` extract path and `*_x86` fallbacks),
+and redirects anti-tamper JUMP_SLOT imports (`kill` / `exit` / `abort` /
+`ptrace` / `android_set_abort_message`) to `getpid`. A `wrap.<package>`
+LD_PRELOAD also stubs kill helpers, `syscall(SYS_kill|exit*)`, `_exit`,
+and `setuid`/`setgid` family calls: without the latter, WrapperInit dies
+with `SIGSYS` (seccomp blocks syscall 106 / `setgid` during AssetManager
+idmap verification). DarkDex waits until app/shell maps appear, skips
+`/system`/`/apex` maps, and only treats carves as success when business
+markers appear. CI-only research tooling.

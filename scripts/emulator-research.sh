@@ -113,6 +113,13 @@ if ! timeout --foreground --kill-after=30s 8m \
 fi
 
 adb shell pm path "$PACKAGE" >> "$diagnostics/apk-install.txt" 2>&1
+# Record which shell objects the package actually exposes to the linker.
+{
+  printf '=== nativeLibraryDirectories listing ===\n'
+  adb shell "pm path $PACKAGE | tr -d '\r' | sed 's/^package://' | while read -r p; do echo PATH=\$p; unzip -l \"\$p\" 2>/dev/null | grep -E 'libexec|libhts|ijm_lib' || true; done"
+  printf '=== extracted lib dir ===\n'
+  adb shell "ls -la /data/app/*/com.yueme.itv*/lib/x86_64/ 2>/dev/null || ls -la /data/app/*/*/lib/x86_64/ 2>/dev/null || true"
+} > "$diagnostics/native-libs.txt" 2>&1 || true
 adb shell "rm -rf '$remote_dir' && mkdir -p '$remote_dir/dex'"
 adb push private/libdd "$remote_dir/libdd" \
   > "$diagnostics/extractor-push.txt" 2>&1
