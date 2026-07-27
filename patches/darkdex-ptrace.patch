@@ -11,7 +11,7 @@
  static const uint8_t DEXM[4]={0x64,0x65,0x78,0x0a}, CDEXM[4]={0x63,0x64,0x65,0x78};
  #pragma pack(push,1)
  struct MapItem{uint16_t type;uint16_t un;uint32_t size;uint32_t off;};
-@@ -22,21 +26,179 @@
+@@ -22,21 +26,183 @@
  static uint32_t carve_size(const uint8_t*p,size_t a){if(a<0x70)return 0;if(*(uint32_t*)(p+40)!=0x12345678u)return 0;
   uint32_t fs=*(uint32_t*)(p+32),hs=*(uint32_t*)(p+36);if(hs<0x28||hs>0x200)return 0;if(fs<hs||fs>96u*1024*1024)return 0;return fs;}
  
@@ -106,25 +106,29 @@
 +
 +// One-shot path inventory so CI can see whether the shell ever mapped.
 +static void dump_maps_paths(int pid,int attempt){
-+ static int dumped=0; if(dumped)return; dumped=1;
 + char mpath[256],line[1024];
 + snprintf(mpath,sizeof(mpath),"/proc/%d/maps",pid);
 + FILE*mf=fopen(mpath,"r");if(!mf)return;
-+ int n=0;
-+ printf("DARKDEX_MAPS_SAMPLE attempt=%d pid=%d\n",attempt,pid);
++ char interesting[64][512]; int ni=0;
++ char general[32][512]; int ng=0;
 + while(fgets(line,sizeof line,mf)){
 +  char*path=strchr(line,'/');
 +  if(!path) continue;
-+  if(strstr(path,"/data/")||strstr(path,"libexec")||strstr(path,"ijm")
-+     ||strstr(path,"apk")||strstr(path,".so")
-+     ||strstr(path,"dex")||strstr(path,"jit")||strstr(path,"dalvik")){
-+   size_t L=strlen(path); while(L&&(path[L-1]=='\n'||path[L-1]=='\r')) path[--L]=0;
-+   printf("DARKDEX_MAP %s\n",path);
-+   if(++n>=80) break;
++  size_t L=strlen(path); while(L&&(path[L-1]=='\n'||path[L-1]=='\r')) path[--L]=0;
++  int hot = strstr(path,"/data/app")||strstr(path,"libexec")||strstr(path,"ijm")
++         ||strstr(path,"yueme")||strstr(path,"base.apk")||strstr(path,"/data/data")
++         ||strstr(path,"/data/user") ? 1 : 0;
++  if(hot){
++   if(ni<64){ strncpy(interesting[ni],path,511); interesting[ni][511]=0; ni++; }
++  }else if(ng<32 && (strstr(path,".so")||strstr(path,"apk")||strstr(path,"dex")||strstr(path,"/data/"))){
++   strncpy(general[ng],path,511); general[ng][511]=0; ng++;
 +  }
 + }
 + fclose(mf);
-+ printf("DARKDEX_MAPS_SAMPLE_END count=%d\n",n);
++ printf("DARKDEX_MAPS_SAMPLE attempt=%d pid=%d hot=%d general=%d\n",attempt,pid,ni,ng);
++ for(int i=0;i<ni;i++) printf("DARKDEX_MAP %s\n",interesting[i]);
++ if(ni==0){ for(int i=0;i<ng;i++) printf("DARKDEX_MAP %s\n",general[i]); }
++ printf("DARKDEX_MAPS_SAMPLE_END hot=%d\n",ni);
 +}
 +
 +static int has_business_marker(const std::set<std::string>&classes,
@@ -205,7 +209,7 @@
    buf.resize(sz);ssize_t n=pread(fd,buf.data(),sz,s);if(n<=0)continue;const uint8_t*B=buf.data();
  
    for(size_t i=0;i+0x70<=(size_t)n;i+=4){
-@@ -71,20 +233,88 @@
+@@ -71,20 +237,88 @@
  
    for(size_t i=0;i+8<(size_t)n;i++){
     if(!memcmp(B+i,"http",4)&&(!memcmp(B+i,"http://",7)||!memcmp(B+i,"https://",8))){size_t j=i;std::string u;
@@ -232,7 +236,7 @@
 + int ready_now=maps_look_ready(pid);
 + printf("DARKDEX_ATTEMPT attempt=%d pid=%d dex=%d recovered=%d biz=%d maps_total=%d maps_skip_fw=%d maps_scan=%d ready=%d\n",
 +        attempt,pid,dex,rec,biz,maps_total,maps_skip_fw,maps_scan,ready_now);
-+ if(!ready_now) dump_maps_paths(pid,attempt);
++ if(!ready_now && (attempt<=2 || attempt%3==0)) dump_maps_paths(pid,attempt);
 + *out_dex=dex;*out_rec=rec;
 + if((dex>0||rec>0) && biz){
 +  char ip[640];snprintf(ip,640,"%s/intel.txt",out);FILE*io=fopen(ip,"w");

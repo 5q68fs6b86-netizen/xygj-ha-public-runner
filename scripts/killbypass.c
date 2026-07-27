@@ -69,16 +69,17 @@ int raise(int sig) {
   return 0;
 }
 
-/* Direct _exit bypasses atexit and our exit() PLT patch. */
+/* Direct _exit bypasses atexit and our exit() PLT patch.
+ * Must NOT block: a forever-pause freezes WrapperInit on the main
+ * thread and the shell never reaches attachBaseContext. Returning
+ * lets the anti-tamper path fall through so loading can continue.
+ */
 void _exit(int status) {
   (void)status;
-  for (;;) {
-    pause();
-  }
 }
 
 void _Exit(int status) {
-  _exit(status);
+  (void)status;
 }
 
 int setgid(gid_t gid) {
